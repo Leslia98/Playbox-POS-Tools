@@ -1,26 +1,23 @@
 # Playbox POS Tools
 
-Odoo Online POS 的「优惠」和「快捷调货」两份独立 Tampermonkey 脚本。
+平板和电脑使用同一份油猴脚本。在 Tampermonkey 中导入需要的脚本，刷新 Odoo 页面即可使用。
 
-## 下载与安装
+## 配货、补货与调货
 
-- [两份脚本安装 ZIP](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/Playbox-POS-Tools.zip)
-- [优惠脚本](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-discount.user.js)
-- [快捷调货脚本](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-transfer.user.js)
-- [版本与说明](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest)
+[下载三份脚本 ZIP](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/Playbox-Inventory-Tools.zip)
 
-这些固定地址始终指向本仓库最新发布版。下载 ZIP 后解压，将两份 `.user.js` 导入 Tampermonkey，更新同名脚本，再刷新 POS。不要同时启用旧副本。
+| 脚本 | 版本 | 单独下载 |
+| --- | --- | --- |
+| 配货中心 | 1.2.13 | [安装配货中心](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-fulfillment.user.js) |
+| 补货提醒 | 0.1.28 | [安装补货提醒](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-replenishment.user.js) |
+| 快捷调货 | 0.2.16 | [安装快捷调货](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-transfer.user.js) |
 
-## 0.2.2
+配货中心支持扫描单件码和小盒码。商品搜索下拉框展开时可以直接连续扫码。收到完整条码后，脚本收起搜索结果并高亮对应商品。
 
-快捷调货按选定界面精修：路线标签、型号与颜色同行、来源库存和每箱件数、箱/件数量控件及换算，中西语与小屏布局。优惠继续使用原生商品行折扣，算法未改变。
+## POS 优惠
 
-适用地址：`https://*.odoo.com/pos/*`。基于 Odoo 19 POS；地址通用不代表兼容所有 Odoo 版本。配置按网站、公司、POS 隔离，收藏和待处理索引保存在当前电脑。
+[单独下载优惠脚本](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-discount.user.js) · [下载优惠和快捷调货两份脚本 ZIP](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/Playbox-POS-Tools.zip)
 
-## 验证范围
+以上下载地址始终指向最新发布版。ZIP 可直接从油猴的导入工具打开，也可以解压后逐份安装。已安装同一脚本时，选择更新已有脚本。
 
-29 项本地回归及脚本语法检查通过；Edge 界面对照、数量操作、中西语、窄屏和测试库实际 POS 样式已检查。本轮没有提交付款或调拨。优惠算法此前在测试库验证过原生部分退款与总额、库存恢复。
-
-0.2.2 油猴安装后的冷启动、正式环境业务、关账会计分录、发票和实际打印设备尚未验收。完整说明见 [usage-0.2.2.txt](./usage-0.2.2.txt)。
-
-仅包含本次两份脚本和说明；不包含订单、配置备份或测试记录。不新增 Odoo 模型、字段、compute 或服务器动作。
+[查看发布记录](https://github.com/Leslia98/Playbox-POS-Tools/releases) · [优惠与调货 0.2.2 历史说明](./usage-0.2.2.txt)

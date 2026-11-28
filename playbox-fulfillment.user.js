@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playbox Odoo - 配货中心 正式版
 // @namespace    https://playboxelectronics1.odoo.com/playbox-suite
-// @version      1.2.18.13
+// @version      1.2.18.14
 // @description  平板横屏单行整表；付款后补开配货；已出库仅扫码核对，不重复扣库存。保留扫码提速、F3/F4及原配货流程。
 // @author       Playbox
 // @run-at       document-start
@@ -23,8 +23,8 @@ if (window.top !== window.self || location.protocol !== "https:" ||
 function startFulfillment() {
 const PBFUL_ENTRY_MARKER = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "data-pb-suite-fulfillment-pos" : "data-pb-suite-fulfillment-workspace";
 if (document.documentElement?.hasAttribute(PBFUL_ENTRY_MARKER)) return;
-document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.13");
-document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.13");
+document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.14");
+document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.14");
 
 
 
@@ -1257,7 +1257,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
 
 (function () {
 const PBFUL_MODE = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "desktop" : "workspace";
-const PBFUL_VERSION = "1.2.18.13";
+const PBFUL_VERSION = "1.2.18.14";
 
 (function () {
     "use strict";
@@ -2097,8 +2097,8 @@ function normalizeDashboardPreferences(record) {
     }
 
     async function createSharedEvent(op, detail, session, knownEvents = null) {
+        if (detail?.review) return createReviewEvent(op, detail, session);
         await assertTaskListed(detail?.row);
-        if (detail?.review) return createReviewEvent(op, detail, session, knownEvents);
         const domain = detail?.request
             ? [["x_pb_request_id", "=", Number(detail.request.id)], ["x_name", "=", String(op.id)]]
             : [["x_pb_picking_id", "=", Number(detail.picking.id)], ["x_name", "=", String(op.id)]];
@@ -4748,7 +4748,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         if (["done", "cancel"].includes(state.detail.picking.state)) return;
         const context = { pickingId: Number(state.detail.picking.id), token: state.session?.token || null };
         try {
-            await syncSharedState({ writeAggregate: true });
+            await syncSharedState({ writeAggregate: true, background:true });
             if (Number(state.detail?.picking.id) === context.pickingId && !state.scanProcessing && !state.scanQueue.length)
                 Promise.resolve(refreshVisibleDetailStock()).catch(error => console.warn("配货库存刷新", error));
         } catch (error) {
@@ -4834,15 +4834,18 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             id: Core.makeId("session"), scope: "session", type: previous?.shared ? "update" : "start",
             source: force ? "shared_force_compat" : "shared_join", pickingId: detail.picking.id,
         };
-        await createSharedEvent(op, detail, session);
+        if (detail.review) await appendCheckedReviewEvent(op, detail, session, detail);
+        else await createSharedEvent(op, detail, session, detail.sharedEvents);
         setSession(detail.picking.id, session);
         if (!contextActive()) return { stale: true };
         state.detail = detail; state.session = session; state.pickerDraft = picker;
-        await syncSharedState({ expectedEventId: op.id, writeAggregate: true, renderView: false });
+        while (state.sharedPulling) await sleep(25);
+        if (state.detail?.picking.id !== pickingId || state.session?.token !== session.token) return {stale:true};
+        const confirmed = await syncSharedState({ expectedEventId: op.id, writeAggregate: true, renderView: false });
+        if (!confirmed.tech) throw new Error('SESSION_EVENT_NOT_CONFIRMED');
         if(Number(state.detail?.picking.id)!==Number(pickingId)||state.session?.token!==session.token)return {stale:true};
         localStorage.setItem(LS.picker,picker);state.pickerEditing=false;
         state.lastSavedAt = Date.now(); state.saveError = "";
-        render(); focusScan();
     }
 
     // The acceptance service receives only these two inventory operations.
@@ -5784,7 +5787,7 @@ function inspectOfflineQueue(storage, baseKey) {
         while (state.sharedPulling) await sleep(25);
         // Order-link reconciliation belongs to the regular poll. Counts are
         // checked here, then the aggregate is written once after this event.
-        await syncSharedState({ writeAggregate: false, renderView: false, reconcile: false });
+        const beforeSave = await syncSharedState({ writeAggregate: false, renderView: false, reconcile: false });
         let detail = state.detail;
         assertWritableDetail(detail);
         if (!detail || Number(detail.picking.id) !== context.pickingId || state.session?.token !== context.session.token) throw Object.assign(new Error(pbUiText("配货页面已经切换，本次操作未提交","Cambió la vista de surtido. No se envió esta operación.")), { code: "STALE_CONTEXT" });
@@ -5807,7 +5810,11 @@ function inspectOfflineQueue(storage, baseKey) {
         if (op.bulkBaseline && op.bulkBaseline !== bulkFingerprint(detail)) throw Object.assign(new Error(t("bulkChanged")), { code: "ORDER_CHANGED" });
         if(isSale(detail) && op.salesBaseline && op.salesBaseline!==Core.quantityBaseline(detail.moves))throw Object.assign(new Error(t("saleStale")),{code:"ORDER_CHANGED"});
         const previewTech = applyOperationToTech(detail.tech, detail.moves, op, context.session);
-        await createSharedEvent(op, detail, context.session, detail.sharedEvents);
+        if (detail.review && beforeSave.reviewDetail === detail && !beforeSave.stale) {
+            await appendCheckedReviewEvent(op, detail, context.session, detail);
+        } else {
+            await createSharedEvent(op, detail, context.session, detail.sharedEvents);
+        }
         const focus = productFocusForOperation(op, detail);
         // A slow save must not move selection back from a more recently scanned product.
         if (!state.pendingQuantityOps.has(op.id) || state.productFocus?.token === op.id) rememberProductFocus(focus);
@@ -9574,7 +9581,10 @@ function inspectOfflineQueue(storage, baseKey) {
                 else if (act === "recover-orphan-offline") await recoverOrphanOffline();
                 else if (act === "review-offline") await reviewPendingOffline();
                 else if (act === "withdrawn-history") await showWithdrawnOfflineHistory();
-                else if (act === "sync-offline") { await syncOfflineNow(); if (state.detail) await refreshOrderNotes([state.detail.row]); }
+                else if (act === "sync-offline") {
+                    const row = state.detail?.row;
+                    await Promise.all([syncOfflineNow(), row && refreshOrderNotes([row])]);
+                }
                 else if (act === "order-note") await editOrderNote(state.detail?.row);
                 else if (el.dataset.orderNote) await editOrderNote(state.rows.find(row => row.key === el.dataset.orderNote));
                 else if (act === "lang") { PBUI.set(PBUI.get() === "zh-CN" ? "es-MX" : "zh-CN"); }
@@ -12939,14 +12949,21 @@ async function fulfillmentPay() {
             responsible:{name:tech.picker||'',source:tech.picker?'script':'none'},
             completedPrepickArchive:[],completedArchiveError:''};
     }
-    async function createReviewEvent(op, detail, session, knownEvents=null) {
-        await assertTaskListed(detail.row);
+    async function createReviewEvent(op, detail, session) {
         const fresh = await loadReviewDetail(detail.row,{catalog:detail});
+        return appendCheckedReviewEvent(op, detail, session, fresh);
+    }
+
+    // Callers supply a server read from this locked operation, never a previously displayed detail.
+    async function appendCheckedReviewEvent(op, detail, session, fresh) {
         if (fresh.reviewBaseline !== detail.reviewBaseline || fresh.tech.reviewCompleted) throw new Error('REVIEW_CHANGED_OR_COMPLETE');
         if(fresh.legacyPendingCount)throw reviewError('LEGACY_REVIEW_PENDING','旧补开仍有待上传数据，请先同步，未建立新记录。','Sincronice primero los pendientes de la revisión anterior.');
         const operation=reviewOperation(detail.picking.id);
         const domain=[['x_pb_operation','=',operation],['x_name','=',String(op.id)]];
-        const existing=await searchRead(SHARED_EVENT_MODEL,domain,['id','x_name','x_pb_payload'],{limit:1});
+        const [, existing] = await Promise.all([
+            assertTaskListed(detail.row),
+            searchRead(SHARED_EVENT_MODEL,domain,['id','x_name','x_pb_payload'],{limit:1}),
+        ]);
         if(existing.length)return verifyExistingOperation(existing[0],op);
         const values=eventValuesForOperation(op,detail,session);
         values.x_pb_picking_id=false;values.x_pb_request_id=false;values.x_pb_move_id=false;
@@ -12957,9 +12974,24 @@ async function fulfillmentPay() {
         try {const id=await rpc(SHARED_EVENT_MODEL,'create',[values]);return {id,...values};}
         catch(error){const saved=await searchRead(SHARED_EVENT_MODEL,domain,['id','x_name','x_pb_payload'],{limit:1});if(saved.length)return verifyExistingOperation(saved[0],op);throw error;}
     }
+    function sameReviewView(prior, fresh) {
+        if (prior.products !== fresh.products || prior.stock !== fresh.stock ||
+            prior.boxCodesLoadedAt !== fresh.boxCodesLoadedAt || prior.nativePicking.write_date !== fresh.nativePicking.write_date ||
+            prior.reviewBaseline !== fresh.reviewBaseline || prior.legacyReview?.revision !== fresh.legacyReview?.revision ||
+            prior.legacyPendingCount !== fresh.legacyPendingCount || prior.sharedEvents.length !== fresh.sharedEvents.length) return false;
+        return JSON.stringify(prior.row.order) === JSON.stringify(fresh.row.order) &&
+            JSON.stringify(prior.moves) === JSON.stringify(fresh.moves) &&
+            prior.sharedEvents.every((event,i) => {
+                const next = fresh.sharedEvents[i];
+                return event.id === next.id && event.x_name === next.x_name && event.x_pb_status === next.x_pb_status &&
+                    event.x_pb_payload === next.x_pb_payload && event.x_pb_picker === next.x_pb_picker &&
+                    event.x_pb_device_id === next.x_pb_device_id && event.x_pb_client_time === next.x_pb_client_time;
+            });
+    }
     async function syncReviewState(options={}) {
         const prior=state.detail, token=state.session?.token;
         state.sharedPulling=true;
+        if (options.manual) updateSyncIndicator();
         try {
             const fresh=await loadReviewDetail(prior.row,{catalog:prior});
             if(options.expectedEventId) {
@@ -12968,8 +13000,9 @@ async function fulfillmentPay() {
                 if(rejected)throw Object.assign(new Error(rejected.code),{code:'EVENT_REJECTED',eventError:rejected});
             }
             const active=state.detail?.picking.id===prior.picking.id && state.session?.token===token;
-            if(active){state.detail=fresh;state.lastSavedAt=Date.now();state.saveError='';if(fresh.tech.reviewCompleted)enterReadOnlyDetail(fresh);if(options.renderView!==false)render();}
-            return {changed:true,tech:fresh.tech,events:fresh.sharedEvents,stale:!active};
+            const changed = !options.background || !sameReviewView(prior, fresh);
+            if(active){state.detail=fresh;state.lastSavedAt=Date.now();state.saveError='';if(fresh.tech.reviewCompleted)enterReadOnlyDetail(fresh);if(changed && options.renderView!==false)render();}
+            return {changed,tech:fresh.tech,events:fresh.sharedEvents,reviewDetail:fresh,stale:!active};
         }finally{state.sharedPulling=false;updateSyncIndicator();}
     }
     function completeUnifiedReview() { return reviewAcceptanceService.complete(); }

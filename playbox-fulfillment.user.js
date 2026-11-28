@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playbox Odoo - 配货中心 正式版
 // @namespace    https://playboxelectronics1.odoo.com/playbox-suite
-// @version      1.2.18.8
+// @version      1.2.18.10
 // @description  平板横屏单行整表；付款后补开配货；已出库仅扫码核对，不重复扣库存。保留扫码提速、F3/F4及原配货流程。
 // @author       Playbox
 // @run-at       document-start
@@ -23,8 +23,8 @@ if (window.top !== window.self || location.protocol !== "https:" ||
 function startFulfillment() {
 const PBFUL_ENTRY_MARKER = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "data-pb-suite-fulfillment-pos" : "data-pb-suite-fulfillment-workspace";
 if (document.documentElement?.hasAttribute(PBFUL_ENTRY_MARKER)) return;
-document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.8");
-document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.8");
+document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.10");
+document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.10");
 
 
 
@@ -1257,7 +1257,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
 
 (function () {
 const PBFUL_MODE = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "desktop" : "workspace";
-const PBFUL_VERSION = "1.2.18.8";
+const PBFUL_VERSION = "1.2.18.10";
 
 (function () {
     "use strict";
@@ -2454,7 +2454,7 @@ function legacyReviewReplay(events, snapshot) {
             throwIfReadCancelled(readOptions);
             for (const key of keys) state.orderNoteErrors.set(key, error.message || String(error));
             throw error;
-        } finally { updateOrderNoteDisplay(); }
+        } finally { if (!readOptions?.cancelled && !(readOptions && state.detailRequest === readOptions && state.view === "dashboard")) updateOrderNoteDisplay(); }
     }
 
     function updateOrderNoteDisplay() {
@@ -2595,23 +2595,43 @@ function legacyReviewReplay(events, snapshot) {
         if(verified?.action!==action)throw new Error('TASK_MEMBERSHIP_RESULT_UNCONFIRMED');
         state.taskMembership ||= new Map();state.taskMembership.set(row.key,verified);invalidateDashboardIndex();return verified;
     }
+    async function readWithdrawalState(row) {
+        if (row.review) return readReviewTaskDetail(row, {membershipOnly:true});
+        const snapshot = await readDeliveryTaskSnapshot(row);
+        return {...snapshot, sharedEventCount:snapshot.sharedEvents.length};
+    }
+
+    function showVerifiedWithdrawal(row, membership) {
+        state.taskMembership ||= new Map();
+        state.taskMembership.set(row.key, membership);
+        state.rows = state.rows.filter(item => item.key !== row.key);
+        if (state.open && state.view === "dashboard") {
+            updateDashboardSearchResults();
+            setTimeout(() => {
+                if (state.open && state.view === "dashboard" && !state.detailRequest) refresh(true);
+            }, 0);
+        }
+    }
+
     async function withdrawTaskFromList(key) {
         const row=state.rows.find(r=>r.key===key);
         if(!row||!row.review&&!isSale(row))throw new Error('TASK_WITHDRAWAL_NOT_SUPPORTED');
         assertNoTaskPending(row);
         const prior=await latestTaskMembership(key);
-        if(prior?.action==='withdraw'){invalidateDashboardIndex();await refresh(true);return;}
-        const detail=await readTaskDetail(row);
+        if(prior?.action==='withdraw'){invalidateDashboardIndex();showVerifiedWithdrawal(row,prior);return;}
+        const detail=await readWithdrawalState(row);
         if(isReadOnlyDetail(detail)||detail.tech.validation)throw new Error(pbUiText('任务已完成或正在验收，不能移出待办。','La tarea está terminada o validándose.'));
         const baseline=taskMembershipFingerprint(detail),es=state.lang==='es';
         const p=Core.progress(detail.tech,detail.moves);
         await showPrompt(`${row.order.pos_reference||row.order.name}\n${detail.nativePicking?.name||detail.picking.name}\n${statusLabel(row.status)} · ${p.scanned}/${p.demand}\n`+(es?'¿Retirar solo esta tarea? Se conservan pedido, pago, entrega, inventario y escaneos. Puede restaurarla desde el historial.':'确认仅移出这次配货任务？原订单、付款、交货、库存和扫码记录全部保留，可在“已移出任务”恢复。'),'confirm',{
             title:es?'Retirar tarea':'移出配货待办',keepOpenOnError:true,actions:[{label:es?'Volver':'返回',value:false},{label:es?'Confirmar retiro':'确认移出',primary:true,waitForAction:true,onClick:()=>withDeviceMutationLock(row.picking.id,async()=>{
                 assertNoTaskPending(row);
-                const fresh=await readTaskDetail(row);
+                const fresh=await readWithdrawalState(row);
+                assertNoTaskPending(row);
                 if(isReadOnlyDetail(fresh)||fresh.tech.validation||taskMembershipFingerprint(fresh)!==baseline)throw new Error(pbUiText('另一端的扫码或状态已变化，请返回重新核对后再移出。','Cambió el escaneo o estado; vuelva a revisar.'));
-                await appendTaskMembership(row,'withdraw',fresh,prior?.eventId);
-                await refresh(true);return true;
+                const verified = await appendTaskMembership(row,'withdraw',fresh,prior?.eventId);
+                showVerifiedWithdrawal(row,verified);
+                return true;
             })}]
         });
     }
@@ -2782,11 +2802,13 @@ function legacyReviewReplay(events, snapshot) {
                 (!m2oId(linkedPicking.pos_order_id) || m2oId(linkedPicking.pos_order_id) === linkedOrder.id))
                 return readDeliveryTaskDetail(pickingSummaryRow(linkedPicking, linkedOrder, 'order'));
         }
-        await refreshRequestPayments([request], true);
+        const [, sharedEvents] = await Promise.all([
+            refreshRequestPayments([request], true),
+            request.x_pb_change_pending ? [] : loadSharedEvents(null, request.id),
+        ]);
         const freshRow = prepickRow(request);
         const moves = freshRow.moves;
         const storedTech = prepickTech(request, moves);
-        const sharedEvents = request.x_pb_change_pending ? [] : await loadSharedEvents(null, request.id);
         const tech = request.x_pb_change_pending ? storedTech : Core.isSharedMode(storedTech) ? Core.replaySharedEvents(storedTech, moves, sharedEvents) : storedTech;
         const orderProductIds = [...new Set(moves.map((move) => Number(move.product_id[0])))];
         const productIds = [...new Set([...orderProductIds, ...Object.entries(tech.extraCounts || {}).filter(([, qty]) => Number(qty) > 0).map(([id]) => Number(id))])];
@@ -4094,11 +4116,9 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         const registrations=postpaidMode?[]:await searchRead(PREPICK_MODEL,[['x_pb_state','not in',['cancelled','bridge_detached']]],
             ['id','x_pb_pos_order_id','x_pb_picking_id','x_pb_order_uuid','x_pb_state'],{limit:600,order:'id desc'}, readOptions);
         const registeredIds=[...new Set(registrations.map(r=>m2oId(r.x_pb_pos_order_id)).filter(Boolean))];
-        const reviewPicks=reviewIds.length?await searchRead('stock.picking',[['id','in',reviewIds],['state','=','done']],pickingIndexFields(),{limit:reviewIds.length}, readOptions):[];
-        const allIds=[...new Set([...registeredIds,...reviewPicks.map(p=>m2oId(p.pos_order_id)).filter(Boolean)])];
         const knownUuids=[...new Set(registrations.map(r=>r.x_pb_order_uuid).filter(Boolean))];
         const domain=postpaidMode ? [['state','in',['paid','done','invoiced']]] :
-            ['|','|','|',['shipping_date','!=',false],['id','in',allIds],['uuid','in',knownUuids],['lines.sale_order_origin_id','!=',false]];
+            ['|','|','|',['shipping_date','!=',false],['id','in',registeredIds],['uuid','in',knownUuids],['lines.sale_order_origin_id','!=',false]];
         if(orderUuids)domain.push(['uuid','in',orderUuids]);
         const query=postpaidMode ? await reviewOrderQuery(readOptions) : {domain,fields:['id','uuid','name','pos_reference','date_order','shipping_date','partner_id','amount_total','state','config_id','picking_ids','company_id']};
         if(postpaidMode&&orderUuids)query.domain.push(['uuid','in',orderUuids]);
@@ -4123,9 +4143,12 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         const operations=[...new Set([...listedReviewIds.map(id=>reviewOperation(reviewId(id))),...legacyOperations.map(r=>r.operation)])];
         const reviewEvents=listedReviewIds.length?await readAll(SHARED_EVENT_MODEL,[['x_pb_operation','in',operations]],['id','x_name','x_pb_operation','x_pb_payload','x_pb_status','x_pb_picker','x_pb_device_id','x_pb_client_time'],1000, readOptions):[];
         // Group once, preserving each filter's original item order and first-match rules.
+        let sliceStarted = performance.now();
         const yieldListWork = async () => {
             if (readOptions) throwIfReadCancelled(readOptions);
+            if (performance.now() - sliceStarted < 8) return;
             await new Promise(resolve => setTimeout(resolve, 0));
+            sliceStarted = performance.now();
             if (readOptions) throwIfReadCancelled(readOptions);
         };
         const group = async (rows, key) => {
@@ -4314,9 +4337,15 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         return state.rows;
     }
     function dashboardFilterChanged() {
-        if (state.orderSource === 'pos' && state.postpaidMode) {cancelDashboardRead();invalidateDashboardIndex();updateDashboardSearchResults();refresh(true);return;}
-        if (state.orderSource === 'sale') { salesRequestKey(); updateDashboardSearchResults(); refresh(true); }
-        else updateDashboardSearchResults();
+        const scope = dashboardRequestScope();
+        const request = state.dashboardRequest;
+        // A receipt lookup owns an unscoped request until the user types another search.
+        const superseded = request && (request.scope ? request.scope !== scope : Boolean(state.search.trim()));
+        if (superseded) cancelDashboardRead();
+        updateDashboardSearchResults();
+        if (state.orderSource === 'sale' || (state.postpaidMode && state.posListScope !== scope)) {
+            if (!state.dashboardRequest) refresh(true);
+        }
     }
 
     function scheduleIndexedPrepickReconcile() {
@@ -4343,7 +4372,8 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         }, 1000);
     }
 
-    function filteredRows(options = {}) {
+    const orderKeyCollator = new Intl.Collator(undefined, { numeric: true });
+    function filteredRows(counts) {
         if (state.orderSource === 'sale') return state.salesPage?.key === salesRequestKey() ? state.rows.filter(r => isSale(r) && r.picking?.state !== 'cancel' && r.order.state !== 'cancel') : [];
         const q = String(state.search || '').trim().toLowerCase();
         let rows = state.rows.filter(row => (isSale(row) ? 'sale' : 'pos') === state.orderSource && row.picking?.state !== 'cancel' && row.order.state !== 'cancel' && row.request?.x_pb_state !== 'cancelled');
@@ -4361,8 +4391,9 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
                 return Date.parse(String(date || '').replace(' ', 'T') + 'Z') >= cutoff;
             });
         }
-        if (!q && !options.allStatuses) rows = rows.filter(row => row.status === state.tab);
-        rows.sort((a, b) => (String(a.order.date_order).localeCompare(String(b.order.date_order)) || String(a.key).localeCompare(String(b.key), undefined, { numeric: true })) * (state.sort === 'oldest' ? 1 : -1));
+        if (counts) for (const row of rows) counts[row.status] = (counts[row.status] || 0) + 1;
+        if (!q) rows = rows.filter(row => row.status === state.tab);
+        rows.sort((a, b) => (String(a.order.date_order).localeCompare(String(b.order.date_order)) || orderKeyCollator.compare(String(a.key), String(b.key))) * (state.sort === 'oldest' ? 1 : -1));
         return rows;
     }
 
@@ -7046,6 +7077,12 @@ function inspectOfflineQueue(storage, baseKey) {
     // Preserve the user's horizontal tab position across polling-driven full renders.
     let statusTabViewport = { key: '', left: 0 };
     const statusTabViewportKey = () => JSON.stringify([state.orderSource, state.tab, state.lang]);
+    function revealStatusTab(tabs, selected) {
+        if (getComputedStyle(tabs).display === 'grid') return;
+        const a = selected.getBoundingClientRect(), b = tabs.getBoundingClientRect();
+        if (a.left < b.left + 4) tabs.scrollLeft += a.left - b.left - 4;
+        else if (a.right > b.right - 4) tabs.scrollLeft += a.right - b.right + 4;
+    }
     function rememberStatusTabViewport() {
         const tabs = root?.querySelector('.pbful-tabs');
         if (tabs && statusTabViewport.key === statusTabViewportKey()) statusTabViewport.left = tabs.scrollLeft;
@@ -7082,7 +7119,7 @@ function inspectOfflineQueue(storage, baseKey) {
             next = makeArrow(1, state.lang === 'es' ? 'Ver estados siguientes' : '向右查看状态', '›');
             nav.prepend(previous); nav.append(next);
             tabs.addEventListener('scroll', () => {
-                if (!tabs.isConnected || statusTabViewport.key !== tabKey) return;
+                if (!tabs.isConnected || statusTabViewport.key !== statusTabViewportKey()) return;
                 statusTabViewport.left = tabs.scrollLeft;
                 update(false);
             }, { passive: true });
@@ -7126,9 +7163,7 @@ function inspectOfflineQueue(storage, baseKey) {
             if (reveal && geometry !== lastGeometry && !restoreTabPosition && !lastGeometry) {
                 const selected = tabs.querySelector('[aria-selected="true"]');
                 if (selected && !vertical) {
-                    const a = selected.getBoundingClientRect(), b = tabs.getBoundingClientRect();
-                    if (a.left < b.left + 4) tabs.scrollLeft += a.left - b.left - 4;
-                    else if (a.right > b.right - 4) tabs.scrollLeft += a.right - b.right + 4;
+                    revealStatusTab(tabs, selected);
                 }
             }
             lastGeometry = geometry;
@@ -8249,8 +8284,23 @@ function inspectOfflineQueue(storage, baseKey) {
     }
 
     function statusLabel(status) { return t(status) || Core.STATUS_LABELS[status] || status; }
-    function money(value) { return new Intl.NumberFormat(state.lang === "es" ? "es-MX" : "zh-CN", { style: "currency", currency: "MXN" }).format(Number(value || 0)); }
-    function shortDate(value) { if (!value) return "-"; const d = new Date(String(value).replace(" ", "T") + (String(value).includes("Z") ? "" : "Z")); return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString(state.lang === "es" ? "es-MX" : "zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }
+    const orderFormatters = new Map();
+    function formattersForLanguage() {
+        const locale = state.lang === "es" ? "es-MX" : "zh-CN";
+        if (!orderFormatters.has(locale)) {
+            orderFormatters.set(locale, {
+                money: new Intl.NumberFormat(locale, { style: "currency", currency: "MXN" }),
+                date: new Intl.DateTimeFormat(locale, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }),
+            });
+        }
+        return orderFormatters.get(locale);
+    }
+    function money(value) { return formattersForLanguage().money.format(Number(value || 0)); }
+    function shortDate(value) {
+        if (!value) return "-";
+        const d = new Date(String(value).replace(" ", "T") + (String(value).includes("Z") ? "" : "Z"));
+        return Number.isNaN(d.getTime()) ? String(value) : formattersForLanguage().date.format(d);
+    }
     function shortTime(value) { if (!value) return "--:--"; return new Date(value).toLocaleTimeString(state.lang === "es" ? "es-MX" : "zh-CN", { hour: "2-digit", minute: "2-digit" }); }
 
     function rowsFingerprint(rows = state.rows) {
@@ -8393,12 +8443,12 @@ function inspectOfflineQueue(storage, baseKey) {
     function renderDashboard() {
         if(isColorWorkspaceView()) return renderColorSplitDashboard();
         const tabs = ["pending", "picking", "ready", "exception", "done", "cancelled"];
-        const wh = warehouses(); const rows = filteredRows();
-        const categoryRows = filteredRows({allStatuses:true});
-        const counts = state.orderSource === 'sale' ? (state.salesPage?.counts || {}) : Object.fromEntries(tabs.map(code => [code, categoryRows.filter(row => row.status === code).length]));
+        const wh = warehouses();
+        const counts = state.orderSource === 'sale' ? (state.salesPage?.counts || {}) : {};
+        const rows = filteredRows(counts);
         return `<div class="pbful-shell" data-view="dashboard">
           ${renderDashboardHeader(`${t("subtitle")} · ${modeLabel()} · v${esc(VERSION)}`)}
-          ${sourceTabs()}<div class="pbful-dashboard"><nav class="pbful-tabs" role="tablist" aria-label="${t("status")}">${tabs.map((code) => `<button role="tab" aria-selected="${state.tab === code}" class="${state.tab === code ? "active" : ""}" data-tab="${code}" title="${esc(statusLabel(code))}"><i class="pbful-status-dot ${code}"></i><span>${statusLabel(code)}</span><b>${dashboardIndexPending() ? "—" : counts[code]}</b></button>`).join("")}</nav>
+          ${sourceTabs()}<div class="pbful-dashboard"><nav class="pbful-tabs" role="tablist" aria-label="${t("status")}">${tabs.map((code) => `<button role="tab" aria-selected="${state.tab === code}" class="${state.tab === code ? "active" : ""}" data-tab="${code}" title="${esc(statusLabel(code))}"><i class="pbful-status-dot ${code}"></i><span>${statusLabel(code)}</span><b>${dashboardIndexPending() ? "—" : counts[code] || 0}</b></button>`).join("")}</nav>
           <section class="pbful-content"><div class="pbful-section-title"><div><small>${t("overview")}</small><strong id="pbful-result-title">${state.search.trim() ? (state.lang === "es" ? "Resultados · Todos los estados" : "搜索结果 · 全部配货状态") : statusLabel(state.tab)}</strong></div><span id="pbful-order-result-count">${dashboardIndexPending() ? t("syncing") : (state.orderSource === "sale" ? state.salesPage?.total || 0 : rows.length)}</span></div>
           <section class="pbful-filters"><label class="pbful-search"><span class="pbful-sr-only">${t("search")}</span><slot name="pbful-order-search"></slot></label><label><span>${t("warehouse")}</span><select id="pbful-warehouse">${wh.map(([id, name]) => `<option value="${id}" ${state.warehouse === id ? "selected" : ""}>${esc(name)}</option>`).join("")}<option value="__all__" ${state.warehouse === "__all__" ? "selected" : ""}>${t("all")}</option></select></label>${salesFilters()}<button class="pbful-sort" data-act="sort">${state.orderSource === "sale" ? (state.sort === "oldest" ? t("saleOldest") : t("saleLatest")) : (state.sort === "oldest" ? t("oldest") : t("latest"))}</button>${dashboardHistoryPicker()}<button data-act="task-membership-history">${state.lang==='es'?'Tareas retiradas':'已移出任务'}</button></section>
           <div class="pbful-index-hint" role="status"><span data-index-summary>${dashboardSummaryHint()}${state.dashboardRefreshing ? ` · ${t("syncing")}` : ""}</span></div>
@@ -8460,15 +8510,15 @@ function inspectOfflineQueue(storage, baseKey) {
 
     function updateDashboardSearchResults() {
         if (!root || state.view !== "dashboard") return;
-        const rows = filteredRows();
+        const counts = state.orderSource === 'sale' ? (state.salesPage?.counts || {}) : {};
+        const rows = filteredRows(counts);
         const count = root.getElementById("pbful-order-result-count");
         if (count) count.textContent = dashboardIndexPending() ? t("syncing") : String(state.orderSource === "sale" ? state.salesPage?.total || 0 : rows.length);
         const title = root.getElementById("pbful-result-title");
         if (title) title.textContent = state.search.trim() ? (state.lang === "es" ? "Resultados · Todos los estados" : "搜索结果 · 全部配货状态") : statusLabel(state.tab);
-        const totals = filteredRows({allStatuses:true});
         for (const button of root.querySelectorAll('.pbful-tabs [data-tab]')) {
             const badge = button.querySelector('b');
-            if (badge) badge.textContent = dashboardIndexPending() ? "—" : String(state.orderSource === "sale" ? state.salesPage?.counts?.[button.dataset.tab] || 0 : totals.filter(row => row.status === button.dataset.tab).length);
+            if (badge) badge.textContent = dashboardIndexPending() ? "—" : String(counts[button.dataset.tab] || 0);
         }
         // Keep the result container present across loading, failure and retry.
         // Initial list errors stay beside the list instead of moving to the drawer.
@@ -9011,7 +9061,9 @@ function inspectOfflineQueue(storage, baseKey) {
         state.loading = true;updateSyncIndicator();
         toast(`${t("openingOrder")}…`, "info", 8000);
         try {
-            let [boxSync, initialDetail] = await Promise.all([ensureBoxMappingsFresh(), loadDetail(row,{readOptions:request}), refreshOrderNotes([row],request).catch(() => {})]);
+            // Notes update their own label. Only the barcode map and task data gate scanning.
+            void refreshOrderNotes([row],request).catch(() => {});
+            let [boxSync, initialDetail] = await Promise.all([ensureBoxMappingsFresh(), loadDetail(row,{readOptions:request})]);
             if(!current())return false;
             if (initialDetail?.review && initialDetail.legacyPendingCount) initialDetail = await resumeLegacyReviewPending(initialDetail);
             if(!current())return false;
@@ -9515,7 +9567,19 @@ function inspectOfflineQueue(storage, baseKey) {
                 else if (act === "sale-cancel-ack") await runNoticeAction(el, acknowledgeSalesCancellation);
                 else if (el.dataset.workspace === "color-split") workspaceNavigation.openColorSplit();
                 else if (el.dataset.source) await workspaceNavigation.openSource(el.dataset.source);
-                else if (el.dataset.tab) { state.tab = el.dataset.tab; saveDashboardPreferences(); render(); dashboardFilterChanged(); }
+                else if (el.dataset.tab && el.dataset.tab !== state.tab) {
+                    state.tab = el.dataset.tab;
+                    saveDashboardPreferences();
+                    const tabs = el.closest('.pbful-tabs');
+                    for (const button of tabs.querySelectorAll('[data-tab]')) {
+                        const selected = button === el;
+                        button.classList.toggle('active', selected);
+                        button.setAttribute('aria-selected', String(selected));
+                    }
+                    revealStatusTab(tabs, el);
+                    statusTabViewport = {key: statusTabViewportKey(), left: tabs.scrollLeft};
+                    dashboardFilterChanged();
+                }
                 else if (el.dataset.days) { state.days = Number(el.dataset.days); saveDashboardPreferences(); render(); }
                 else if (el.dataset.open) await openOrder(el.dataset.open);
                 else if (el.dataset.native) { const rawId = Number(el.dataset.native); const id = isReviewId(rawId) ? reviewNativeId(rawId) : rawId; if (Number.isSafeInteger(id) && id > 0) window.open(`/odoo/deliveries/${id}`, "_blank", "noopener"); }
@@ -12801,12 +12865,16 @@ async function fulfillmentPay() {
         // Only catalog rows are reused for 15 seconds. Native picking/moves,
         // payment/refund/return policy and both review logs are always reread.
         const catalog=options.catalog?.review?{...options.catalog,picking:options.catalog.nativePicking}:options.catalog;
-        const detail = await readDeliveryTaskDetail(nativeRow,{...options,catalog,reviewCatalog:true});
-        if (detail.picking.state !== 'done' || !posPaymentConfirmed(row.order)) throw new Error('REVIEW_DELIVERY_CHANGED');
-        const nativeMoves = detail.moves.filter(m => m.state === 'done' && Number(m.quantity)>0);
+        const snapshot = await readDeliveryTaskSnapshot(nativeRow,options.readOptions);
+        if (snapshot.picking.state !== 'done' || !posPaymentConfirmed(row.order)) throw new Error('REVIEW_DELIVERY_CHANGED');
+        const nativeMoves = snapshot.moves.filter(m => m.state === 'done' && Number(m.quantity)>0);
         if (!nativeMoves.length) throw new Error(state.lang==='es'?'No hay mercancía entregada para revisar.':'没有实际出库商品可供补开核对。');
         if (nativeMoves.some(m => !Number.isSafeInteger(Number(m.quantity)))) throw new Error('REVIEW_INVALID_QUANTITY');
-        const [events,legacyEvents]=await Promise.all([readReviewEvents(row.picking.id,options.readOptions),readLegacyReviewEvents(row.order,options.readOptions)]);
+        const [events, legacyEvents, detail] = await Promise.all([
+            readReviewEvents(row.picking.id, options.readOptions),
+            readLegacyReviewEvents(row.order, options.readOptions),
+            options.membershipOnly ? snapshot : readDeliveryTaskCatalog(snapshot, {...options, catalog, reviewCatalog:true}),
+        ]);
         if(legacyEvents.length && policy.pickings.filter(p=>p.state!=='cancel'&&p.picking_type_code==='outgoing').length!==1)throw reviewError('LEGACY_REVIEW_SPLIT','旧补开对应多张交货单，数据已保留，请核对关联，未自动分配。','La revisión anterior tiene varias entregas. Revise el vínculo; no se repartieron cantidades.');
         const revision=await legacyReviewRevision(legacyEvents);
         const {moves,fingerprint,tech,legacyReview}=reviewSnapshot(nativeId,row.order.id,nativeMoves,events,{order:row.order,events:legacyEvents,revision});

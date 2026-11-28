@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playbox Odoo - 配货中心 测试库专用
 // @namespace    https://pb-11-23.odoo.com/playbox-suite/qa
-// @version      1.2.18.14
+// @version      1.2.18.15
 // @description  平板横屏单行整表；付款后补开配货；已出库仅扫码核对，不重复扣库存。保留扫码提速、F3/F4及原配货流程。
 // @author       Playbox
 // @run-at       document-start
@@ -23,8 +23,8 @@ if (window.top !== window.self || location.origin !== "https://pb-11-23.odoo.com
 function startFulfillment() {
 const PBFUL_ENTRY_MARKER = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "data-pb-suite-fulfillment-pos" : "data-pb-suite-fulfillment-workspace";
 if (document.documentElement?.hasAttribute(PBFUL_ENTRY_MARKER)) return;
-document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.14");
-document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.14");
+document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.15");
+document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.15");
 
 
 
@@ -1257,7 +1257,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
 
 (function () {
 const PBFUL_MODE = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "desktop" : "workspace";
-const PBFUL_VERSION = "1.2.18.14";
+const PBFUL_VERSION = "1.2.18.15";
 
 (function () {
     "use strict";
@@ -4743,7 +4743,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
 
     async function autoPullSharedState() {
         if (!state.open || state.view !== "detail" || document.visibilityState !== "visible" || !navigator.onLine) return;
-        if (!canPullDetail() || state.confirmingRequestId || state.mutationSyncing || state.offlineFlushing || state.scanProcessing || state.scanQueue.length) return;
+        if (!canPullDetail() || state.bulkAction || state.confirmingRequestId || state.mutationSyncing || state.offlineFlushing || state.scanProcessing || state.scanQueue.length) return;
         // Completed detail is retained for viewing and must never write aggregate state.
         if (["done", "cancel"].includes(state.detail.picking.state)) return;
         const context = { pickingId: Number(state.detail.picking.id), token: state.session?.token || null };
@@ -5338,22 +5338,37 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             const before = bulkFingerprint(state.detail, true);
             const title = t(kind === 'clear' ? 'bulkClear' : 'bulkFill');
             const order = state.detail.row.order.pos_reference || state.detail.row.order.name || state.detail.picking.name;
-            if (!await showPrompt(`${order}\n\n${t(kind === 'clear' ? 'bulkClearConfirm' : 'bulkFillConfirm')}`, 'confirm', { title, confirmLabel: title })) return { cancelled: true };
+            if (!await showPrompt(`${order}\n\n${t(kind === 'clear' ? 'bulkClearConfirm' : 'bulkFillConfirm')}`, 'confirm', {
+                title, confirmLabel: title,
+                onConfirm: () => {
+                    context.confirmed = true;
+                    context.timing = taskTiming('bulk ' + kind);
+                    context.timing?.('confirm');
+                }
+            })) return { cancelled: true };
+            context.timing?.('dialog closed');
             if (!contextActive()) throw Object.assign(new Error(t('bulkChanged')), { code: 'STALE_CONTEXT' });
-            while (state.sharedPulling) await sleep(25);
-            await syncSharedState({ writeAggregate: false, renderView: false });
+            if (!navigator.onLine || offlineQueue().some(op => Number(op.pickingId) === context.pickingId)) throw new Error(t('bulkNeedSync'));
+            const operations = makeBulkOperations(state.detail, kind, context.id);
+            // Requests also reconcile the POS link here. A no-op has no later save to verify it.
+            if (state.detail.request || !operations.length) {
+                while (state.sharedPulling) await sleep(25);
+                const check = await syncSharedState({ writeAggregate: false, renderView: false });
+                if (check.stale || check.busy || check.skipped) throw Object.assign(new Error(t('bulkChanged')), { code: 'ORDER_CHANGED' });
+            }
             if (!contextActive()) throw Object.assign(new Error(t('bulkChanged')), { code: 'STALE_CONTEXT' });
             assertBulkWritable();
             if (before !== bulkFingerprint(state.detail, true)) throw Object.assign(new Error(t('bulkChanged')), { code: 'ORDER_CHANGED' });
             const undoBefore = { counts: Object.fromEntries(state.detail.moves.map(m => [m.id, Number(state.detail.tech.counts?.[m.id] || 0)])), extraCounts: { ...state.detail.tech.extraCounts } };
             const undoStartEventId = Number(state.detail.tech.eventSync?.lastEventId || 0);
-            const operations = makeBulkOperations(state.detail, kind, context.id);
+            context.expectedCounts = before;
             if (!operations.length) { toast(t('bulkNoChange'), 'info'); return { ok: true, completed: 0, total: 0 }; }
             saveUndoRecord(context.pickingId, null);
             const operation = makeBulkSnapshotOperation(state.detail, kind, context.id, operations);
             // Show the requested quantities immediately; this preview is never used as saved state.
             context.previewOp = operation;
             render();
+            context.timing?.('preview');
             const result = await queueOperation(operation);
             if (!result.ok || result.offline) {
                 toast(result.offline
@@ -5370,6 +5385,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         } finally {
             if (state.bulkAction === context) state.bulkAction = null;
             render(); focusScan();
+            context.timing?.('controls ready');
         }
     }
 /* Read-only inspection: never discard malformed or unrecognized durable data. */
@@ -5589,7 +5605,7 @@ function inspectOfflineQueue(storage, baseKey) {
                     flow.queuedMutations = Math.max(0, flow.queuedMutations - 1);
                     flow.mutationSyncing = false;
                     if (!op.scope || op.scope === 'order') renderQuantityFeedback();
-                    else render();
+                    else if (!op.bulkId || state.bulkAction?.id !== op.bulkId) render();
                     focusScan();
                 }
             });
@@ -5787,7 +5803,10 @@ function inspectOfflineQueue(storage, baseKey) {
         while (state.sharedPulling) await sleep(25);
         // Order-link reconciliation belongs to the regular poll. Counts are
         // checked here, then the aggregate is written once after this event.
+        const batch = op.bulkId && op.bulkId === state.bulkAction?.id ? state.bulkAction : null;
+        batch?.timing?.('save lock');
         const beforeSave = await syncSharedState({ writeAggregate: false, renderView: false, reconcile: false });
+        batch?.timing?.('order checked');
         let detail = state.detail;
         assertWritableDetail(detail);
         if (!detail || Number(detail.picking.id) !== context.pickingId || state.session?.token !== context.session.token) throw Object.assign(new Error(pbUiText("配货页面已经切换，本次操作未提交","Cambió la vista de surtido. No se envió esta operación.")), { code: "STALE_CONTEXT" });
@@ -5800,6 +5819,11 @@ function inspectOfflineQueue(storage, baseKey) {
             if (rejected) throw Object.assign(new Error(`并发操作未应用：${rejected.code}`), {code:'EVENT_REJECTED', eventError:rejected});
             if (!['done','applied','ok'].includes(Core.normalizeSharedEvent(existingEvent).status)) throw Object.assign(new Error('扫码事件尚未确认'), {code:'VERIFY_FAILED'});
             return {detail, verified:detail.tech, contextActive:true, duplicate:true};
+        }
+        if (batch?.expectedCounts) {
+            assertBulkWritable();
+            if (beforeSave.busy || beforeSave.skipped || beforeSave.stale || bulkFingerprint(detail, true) !== batch.expectedCounts)
+                throw Object.assign(new Error(t('bulkChanged')), { code: 'ORDER_CHANGED' });
         }
         if (detail.request?.x_pb_state === "cancelled") throw Object.assign(new Error(t("orderCancelledNotice")), { code: "ORDER_CANCELLED" });
         if (quantityOperation(op) && op.requestVersion != null && detail.request && Number(op.requestVersion) !== Number(detail.request.x_pb_version)) throw Object.assign(new Error(t("orderChanged")), { code: "ORDER_CHANGED" });
@@ -5815,6 +5839,7 @@ function inspectOfflineQueue(storage, baseKey) {
         } else {
             await createSharedEvent(op, detail, context.session, detail.sharedEvents);
         }
+        batch?.timing?.('write acknowledged');
         const focus = productFocusForOperation(op, detail);
         // A slow save must not move selection back from a more recently scanned product.
         if (!state.pendingQuantityOps.has(op.id) || state.productFocus?.token === op.id) rememberProductFocus(focus);
@@ -5831,6 +5856,7 @@ function inspectOfflineQueue(storage, baseKey) {
         let synced, verified;
         try {
             synced = await syncSharedState({ expectedEventId: op.id, writeAggregate: true, renderView: false, reconcile: false });
+            batch?.timing?.('readback');
             verified = synced.tech;
             if (!verified || verified.eventSync?.rejectedEvents?.some((item) => item.id === op.id)) throw Object.assign(new Error("事件同步校验失败"), { code: "VERIFY_FAILED" });
         } catch (error) {
@@ -6850,7 +6876,11 @@ function inspectOfflineQueue(storage, baseKey) {
             errorMessage.className = "pbful-note-error-message";
             errorMessage.setAttribute("role", "status");
         }
-        const finish = (value = false) => { item.result = value; dialog.close(); };
+        const finish = (value = false) => {
+            item.result = value;
+            if (value) item.options.onConfirm?.();
+            dialog.close();
+        };
         item.close = finish;
         const buttons = item.options.actions || (item.kind === "confirm" ? [
             { label: state.lang === "es" ? "Volver" : "返回", value: false },
@@ -8363,7 +8393,7 @@ function inspectOfflineQueue(storage, baseKey) {
     function syncView() {
         const pending = pendingCounts();
         if(state.detailRequest)return {mode:"syncing",label:t("openingOrder"),pending};
-        const busy = state.syncing || state.mutationSyncing || state.queuedMutations > 0 || state.offlineFlushing || state.sharedPulling || state.confirmingRequestId;
+        const busy = state.bulkAction?.confirmed || state.syncing || state.mutationSyncing || state.queuedMutations > 0 || state.offlineFlushing || state.sharedPulling || state.confirmingRequestId;
         if (state.validationAction) return { mode: "syncing", label: t("validating"), pending };
         if (busy) {
             const suffix = pending.total ? ` · ${t("localPending")} ${pending.total}` : "";

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playbox Odoo - 配货中心 测试库专用
 // @namespace    https://pb-11-23.odoo.com/playbox-suite/qa
-// @version      1.2.18.15
+// @version      1.2.18.16
 // @description  平板横屏单行整表；付款后补开配货；已出库仅扫码核对，不重复扣库存。保留扫码提速、F3/F4及原配货流程。
 // @author       Playbox
 // @run-at       document-start
@@ -23,8 +23,8 @@ if (window.top !== window.self || location.origin !== "https://pb-11-23.odoo.com
 function startFulfillment() {
 const PBFUL_ENTRY_MARKER = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "data-pb-suite-fulfillment-pos" : "data-pb-suite-fulfillment-workspace";
 if (document.documentElement?.hasAttribute(PBFUL_ENTRY_MARKER)) return;
-document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.15");
-document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.15");
+document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.16");
+document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.16");
 
 
 
@@ -1257,7 +1257,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
 
 (function () {
 const PBFUL_MODE = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "desktop" : "workspace";
-const PBFUL_VERSION = "1.2.18.15";
+const PBFUL_VERSION = "1.2.18.16";
 
 (function () {
     "use strict";
@@ -5339,7 +5339,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             const title = t(kind === 'clear' ? 'bulkClear' : 'bulkFill');
             const order = state.detail.row.order.pos_reference || state.detail.row.order.name || state.detail.picking.name;
             if (!await showPrompt(`${order}\n\n${t(kind === 'clear' ? 'bulkClearConfirm' : 'bulkFillConfirm')}`, 'confirm', {
-                title, confirmLabel: title,
+                title, confirmLabel: title, resolveOnConfirm: true,
                 onConfirm: () => {
                     context.confirmed = true;
                     context.timing = taskTiming('bulk ' + kind);
@@ -6880,6 +6880,8 @@ function inspectOfflineQueue(storage, baseKey) {
             item.result = value;
             if (value) item.options.onConfirm?.();
             dialog.close();
+            // Edge may deliver the native close event a second after the dialog is closed.
+            if (value && item.options.resolveOnConfirm) settlePrompt();
         };
         item.close = finish;
         const buttons = item.options.actions || (item.kind === "confirm" ? [
@@ -6923,15 +6925,18 @@ function inspectOfflineQueue(storage, baseKey) {
         }
         dialog.append(actions);
         dialog.addEventListener("cancel", (event) => { event.preventDefault(); if (!item.running) finish(false); });
-        dialog.addEventListener("close", () => {
+        function settlePrompt() {
+            if (state.activePrompt !== item) return;
+            dialog.removeEventListener("close", settlePrompt);
             dialog.remove();
-            if (state.activePrompt === item) state.activePrompt = null;
+            state.activePrompt = null;
             item.resolve(Boolean(item.result));
             const restore = previousFocus?.isConnected ? previousFocus : root.getElementById(previousFocus?.id || "");
             if (restore && !restore.disabled) restore.focus({ preventScroll: true });
             if (state.renderPending) render();
             openNextPrompt();
-        }, { once: true });
+        }
+        dialog.addEventListener("close", settlePrompt, { once: true });
         root.appendChild(dialog);
         dialog.showModal();
         item.options.onShown?.();

@@ -1,0 +1,55 @@
+name: Publish fulfillment 1.2.18.16
+on:
+  push:
+    branches: [publish/fulfillment-1.2.18.16]
+    paths: [.github/workflows/publish-fulfillment-121816.yml]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c00f6740aa1af3215c1d3d52e8514133347b1d38
+          persist-credentials: false
+      - name: Verify the official userscript and build release bundles
+        shell: python
+        run: |
+          from pathlib import Path
+          from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
+          import subprocess
+          files = sorted(p.name for p in Path('.').glob('playbox-*.user.js'))
+          assert len(files) == 13
+          script = 'playbox-fulfillment.user.js'
+          assert subprocess.check_output(['git', 'hash-object', script], text=True).strip() == '885b87a17b8321c95e6094d32714dfb668168d93'
+          for name in files:
+              subprocess.run(['node', '--check', name], check=True)
+          bundles = {
+              'Playbox-All-Userscripts.zip': files,
+              'Playbox-Inventory-Tools.zip': ['playbox-' + s + '.user.js' for s in ['fulfillment','replenishment','transfer']],
+              'Playbox-POS-Tools.zip': ['playbox-' + s + '.user.js' for s in ['discount','transfer']],
+          }
+          for archive, names in bundles.items():
+              with ZipFile(archive,'w') as z:
+                  for name in names:
+                      info = ZipInfo(name, (2026,11,28,0,0,0))
+                      z.writestr(info, Path(name).read_bytes(), compress_type=ZIP_DEFLATED, compresslevel=9)
+              with ZipFile(archive) as z:
+                  assert z.namelist() == names and z.testzip() is None
+                  assert all(z.read(name) == Path(name).read_bytes() for name in names)
+      - name: Publish official scripts and bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: fulfillment-1.2.18.16
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          配货中心升级到 1.2.18.16，优化了「一键填满」「全部清除」、扫码配货和撤回补开的响应速度。整单修改在服务器回读成功后显示已保存。
+
+          Edge 测试站在同一张两行商品的补开单上交替测试五轮。从页面收到确认到按钮恢复，填满和清除的中位数均约 0.52 秒。
+
+          [安装配货中心正式版](https://github.com/Leslia98/Playbox-POS-Tools/releases/download/fulfillment-1.2.18.16/playbox-fulfillment.user.js) · [下载全部 13 份脚本](https://github.com/Leslia98/Playbox-POS-Tools/releases/download/fulfillment-1.2.18.16/Playbox-All-Userscripts.zip) · [下载配货、补货和调货三件套](https://github.com/Leslia98/Playbox-POS-Tools/releases/download/fulfillment-1.2.18.16/Playbox-Inventory-Tools.zip)
+          NOTES
+          gh release create "$TAG" --draft --target c00f6740aa1af3215c1d3d52e8514133347b1d38 --title 'Playbox 配货中心 1.2.18.16 正式版' --notes-file "$RUNNER_TEMP/notes.md" playbox-*.user.js Playbox-*.zip usage-0.2.2.txt
+          test "$(gh release view "$TAG" --json assets --jq '.assets | length')" -eq 17
+          gh release edit "$TAG" --draft=false --latest

@@ -6,6 +6,8 @@
 
 2026-11-28 从 Tampermonkey 同步，共 13 份。点击名称查看脚本源码。
 
+[下载全部 13 份脚本 ZIP](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/Playbox-All-Userscripts.zip) · [按需单独下载](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest)
+
 | 脚本 | Chrome 版本 |
 | --- | --- |
 | [配货中心 正式版](./playbox-fulfillment.user.js) | 1.2.18.8 |
@@ -28,7 +30,7 @@
 
 | 脚本 | 版本 | 单独下载 |
 | --- | --- | --- |
-| 配货中心 | 1.2.13 | [安装配货中心](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-fulfillment.user.js) |
+| 配货中心 | 1.2.18.8 | [安装配货中心](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-fulfillment.user.js) |
 | 补货提醒 | 0.1.28 | [安装补货提醒](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-replenishment.user.js) |
 | 快捷调货 | 0.2.16 | [安装快捷调货](https://github.com/Leslia98/Playbox-POS-Tools/releases/latest/download/playbox-transfer.user.js) |
 

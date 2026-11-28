@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playbox Odoo - 配货中心 正式版
 // @namespace    https://playboxelectronics1.odoo.com/playbox-suite
-// @version      1.2.13
+// @version      1.2.18.8
 // @description  平板横屏单行整表；付款后补开配货；已出库仅扫码核对，不重复扣库存。保留扫码提速、F3/F4及原配货流程。
 // @author       Playbox
 // @run-at       document-start
@@ -23,8 +23,8 @@ if (window.top !== window.self || location.protocol !== "https:" ||
 function startFulfillment() {
 const PBFUL_ENTRY_MARKER = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "data-pb-suite-fulfillment-pos" : "data-pb-suite-fulfillment-workspace";
 if (document.documentElement?.hasAttribute(PBFUL_ENTRY_MARKER)) return;
-document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.13");
-document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.13");
+document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.8");
+document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.8");
 
 
 
@@ -243,6 +243,24 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
         return Math.max(0, Math.round(n * 1000000) / 1000000);
     }
 
+    // Native row identity. Missing fields in legacy records remain unknown.
+    const provenanceFields = ['picking_id','product_uom','sale_line_id','company_id','location_id','location_dest_id'];
+    function moveProvenance(move) {
+        const data = {};
+        for (const key of provenanceFields) {
+            if (Object.prototype.hasOwnProperty.call(move, key))
+                data[key] = Number(Array.isArray(move[key]) ? move[key][0] : move[key]) || 0;
+        }
+        return data;
+    }
+    function compatibleProvenance(previous, current) {
+        return provenanceFields.every(k => !(k in previous && k in current) || previous[k] === current[k]);
+    }
+    function saleRevision(moves) {
+        return JSON.stringify([...moves].sort((a,b)=>a.id-b.id).map(m=>[
+            m.id, Number(Array.isArray(m.product_id)?m.product_id[0]:m.product_id), demandOf(m), moveProvenance(m)
+        ]));
+    }
     function createTech(moves, clock) {
         const baseline = {};
         const counts = {};
@@ -250,6 +268,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
             const id = String(move.id);
             baseline[id] = {
                 demand: demandOf(move),
+                identity: moveProvenance(move),
                 productId: Array.isArray(move.product_id) ? move.product_id[0] : move.product_id,
             };
             counts[id] = 0;
@@ -297,6 +316,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
             if (!next.baseline[id]) {
                 next.baseline[id] = {
                     demand: demandOf(move),
+                identity: moveProvenance(move),
                     productId: Array.isArray(move.product_id) ? move.product_id[0] : move.product_id,
                 };
             }
@@ -361,7 +381,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
             const id = String(move.id);
             const base = tech.baseline[id];
             const productId = Array.isArray(move.product_id) ? move.product_id[0] : move.product_id;
-            if (!base || Number(base.demand) !== demandOf(move) || Number(base.productId) !== Number(productId)) {
+            if (!base || Number(base.demand) !== demandOf(move) || Number(base.productId) !== Number(productId) || !compatibleProvenance(base.identity || {}, moveProvenance(move))) {
                 return { ok: false, reason: "demand_changed", moveId: move.id };
             }
         }
@@ -481,6 +501,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
         const id = String(move.id);
         const demand = demandOf(move);
         const current = normalizeCount(next.counts[id], demand);
+        assertCountAtEdit(op,current);
         if (!["inc", "dec", "set"].includes(op.type)) {
             const error = new Error("INVALID_OPERATION");
             error.code = "INVALID_OPERATION";
@@ -572,6 +593,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
         const next = clone(tech);
         next.extraCounts ||= {};
         const current = Number(next.extraCounts[String(productId)] || 0);
+        assertCountAtEdit(op,current);
         const step = op.type === "set" ? 1 : operationStep(op);
         let value = op.type === "set" ? Number(op.value) : current + (op.type === "dec" ? -step : step);
         if (!Number.isInteger(value)) {
@@ -725,6 +747,30 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
         return next;
     }
 
+    function quantityIntent(op) {
+        if (!["inc","dec","set"].includes(op?.type) || !["order","extra"].includes(op.scope || "order")) return null;
+        return JSON.stringify([op.scope || "order", op.type, Number(op.moveId || 0), Number(op.productId || 0),
+            op.type==="set" ? Number(op.value) : Number(op.amount ?? 1), op.expectedCount ?? null,
+            Boolean(op.allowOverScan), Boolean(op.guardStrict), String(op.code ?? "")]);
+    }
+
+    function eventIntent(op) {
+        // Ignore queue bookkeeping only at the root. Preserve the contents of nested edits.
+        function canonical(value) {
+            if (Array.isArray(value)) return value.map(canonical);
+            if (value && typeof value === 'object') {
+                return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+            }
+            return value;
+        }
+        const {queuedAt, queuedOrigin, queuedOrder, ...intent} = op;
+        return JSON.stringify(canonical(intent));
+    }
+    function assertCountAtEdit(op,current) {
+        if (op.type==="set" && op.expectedCount != null && Number(op.expectedCount)!==current)
+            throw Object.assign(new Error("数量已变化，请核对后重新输入 / La cantidad cambió. Revísela y vuelva a escribirla."),{code:"EDIT_COUNT_CHANGED"});
+    }
+
     function normalizeSharedEvent(record) {
         const payload = safeParse(record?.payload ?? record?.x_pb_payload) || {};
         const rawOp = payload.op && typeof payload.op === "object" ? payload.op : record?.op && typeof record.op === "object" ? record.op : {};
@@ -814,20 +860,25 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
     }
 
     function replaySharedEvents(tech, moves, records) {
-        if (tech.salesReview) moves = Object.entries(tech.eventSync?.baseTech?.baseline || tech.baseline || {}).map(([id,b])=>({id:Number(id),product_id:b.productId,product_uom_qty:b.demand}));
+        if (tech.salesReview) moves = Object.entries(tech.eventSync?.baseTech?.baseline || tech.baseline || {}).map(([id,b])=>({...b.identity,id:Number(id),product_id:b.productId,product_uom_qty:b.demand}));
         const enabled = enableSharedMode(tech, moves);
         const meta = clone(enabled.eventSync);
         let next = hydrateTech(meta.baseTech, moves);
         next.lock = null;
         next.eventSync = { ...meta };
         const rejected = [];
-        const seen = new Set();
+        const seen = new Map();
         const allEvents = (records || []).map(normalizeSharedEvent).filter((event) => {
             // Order labels are metadata; they must never start picking or affect quantities.
             if (event.op.scope === "order_note") return false;
-            if (!event.name || seen.has(event.name)) return false;
-            seen.add(event.name);
-            return !event.status || ["done", "applied", "ok"].includes(event.status);
+            if (!event.name || (event.status && !["done", "applied", "ok"].includes(event.status))) return false;
+            if (seen.has(event.name)) {
+                if (eventIntent(seen.get(event.name))!==eventIntent(event.op))
+                    throw Object.assign(new Error("同编号扫码记录的内容不同，请核对操作记录 / Dos movimientos incompatibles tienen el mismo identificador: "+event.name),{code:"OPERATION_ID_CONFLICT"});
+                return false;
+            }
+            seen.set(event.name,event.op);
+            return true;
         }).sort((left, right) => left.serverId - right.serverId || left.name.localeCompare(right.name));
         const baseEventId = Math.max(0, Number(meta.baseEventId || 0));
         const events = allEvents.filter((event) => event.serverId > baseEventId);
@@ -839,7 +890,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
             try {
                 if (next.salesReview && op.scope === 'sales_review') {
                     if(next.validation || op.expectedBaseline !== quantityBaseline(moves) || !Array.isArray(op.moves) || op.moves.some(m=>!Number.isSafeInteger(m.id)||m.id<=0||!Number.isSafeInteger(m.product_id)||m.product_id<=0||!Number.isSafeInteger(m.product_uom_qty)||m.product_uom_qty<0)) throw Object.assign(new Error('Order changed'),{code:'ORDER_CHANGED'});
-                    next = rebaseTechForMoves(next,moves,op.moves,{clock,event:'sales_change_confirmed'});
+                    next = rebaseTechForMoves(next,moves,op.moves,{clock,event:'sales_change_confirmed',preserveRows:op.allocation==='move-v1'});
                     next.salesReview=true; moves=op.moves; next.quantityRevision=op.id;
                     continue;
                 }
@@ -962,7 +1013,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
         }));
     }
 
-    function rebaseTechForMoves(tech, oldMoves, newMoves, { clock, event = "order_changed_confirmed" } = {}) {
+    function rebaseTechForMoves(tech, oldMoves, newMoves, { clock, event = "order_changed_confirmed", preserveRows = false } = {}) {
         const current = hydrateTech(tech, oldMoves, clock);
         const byProduct = new Map();
         for (const move of oldMoves || []) {
@@ -977,26 +1028,42 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
         rebased.unknownScans = clone(current.unknownScans || []);
         rebased.exception = clone(current.exception || null);
         rebased.audit = [...(current.audit || []), { id: makeId("audit"), event, at: nowIso(clock) }].slice(-80);
-        const movesByProduct = new Map();
-        for (const move of newMoves || []) {
-            const productId = Number(Array.isArray(move.product_id) ? move.product_id[0] : move.product_id);
-            if (!movesByProduct.has(productId)) movesByProduct.set(productId, []);
-            movesByProduct.get(productId).push(move);
-        }
-        for (const [productId, productMoves] of movesByProduct) {
-            let remaining = (byProduct.get(productId) || 0) + Number(rebased.extraCounts[String(productId)] || 0);
-            delete rebased.extraCounts[String(productId)];
-            productMoves.forEach((move, index) => {
-                const last = index === productMoves.length - 1;
-                const value = last ? remaining : Math.min(remaining, demandOf(move));
-                rebased.counts[String(move.id)] = Math.max(0, value);
-                remaining = Math.max(0, remaining - value);
-            });
-        }
-        // Removed order lines are still physically in the basket until a worker removes them.
-        for (const [productId, count] of byProduct) {
-            if (!movesByProduct.has(productId) && count > 0) {
-                rebased.extraCounts[String(productId)] = Number(rebased.extraCounts[String(productId)] || 0) + count;
+        if (preserveRows) {
+            const targets = new Map(newMoves.map(m => [Number(m.id), m]));
+            for (const old of oldMoves) {
+                const count = current.counts[String(old.id)] || 0;
+                if (!count) continue;
+                const product = Number(Array.isArray(old.product_id) ? old.product_id[0] : old.product_id);
+                const target = targets.get(Number(old.id));
+                const sameProduct = target && Number(Array.isArray(target.product_id) ? target.product_id[0] : target.product_id) === product;
+                if (sameProduct && compatibleProvenance(moveProvenance(old), moveProvenance(target))) {
+                    rebased.counts[String(old.id)] = count;
+                } else {
+                    rebased.extraCounts[product] = (rebased.extraCounts[product] || 0) + count;
+                }
+            }
+        } else {
+            const movesByProduct = new Map();
+            for (const move of newMoves || []) {
+                const productId = Number(Array.isArray(move.product_id) ? move.product_id[0] : move.product_id);
+                if (!movesByProduct.has(productId)) movesByProduct.set(productId, []);
+                movesByProduct.get(productId).push(move);
+            }
+            for (const [productId, productMoves] of movesByProduct) {
+                let remaining = (byProduct.get(productId) || 0) + Number(rebased.extraCounts[String(productId)] || 0);
+                delete rebased.extraCounts[String(productId)];
+                productMoves.forEach((move, index) => {
+                    const last = index === productMoves.length - 1;
+                    const value = last ? remaining : Math.min(remaining, demandOf(move));
+                    rebased.counts[String(move.id)] = Math.max(0, value);
+                    remaining = Math.max(0, remaining - value);
+                });
+            }
+            // Removed order lines are still physically in the basket until a worker removes them.
+            for (const [productId, count] of byProduct) {
+                if (!movesByProduct.has(productId) && count > 0) {
+                    rebased.extraCounts[String(productId)] = Number(rebased.extraCounts[String(productId)] || 0) + count;
+                }
             }
         }
         const p = progress(rebased, newMoves);
@@ -1005,7 +1072,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
         rebased.rev = Number(current.rev || 0) + 1;
         rebased.updatedAt = nowIso(clock);
         const productDemand=rows=>draftLineFingerprint(rows.map(m=>({productId:Array.isArray(m.product_id)?m.product_id[0]:m.product_id,quantity:demandOf(m)})));
-        if(current.packingConfirmation && current.packingConfirmation.revision===quantityRevision(current) && current.packingConfirmation.baseline===quantityBaseline(oldMoves) && canFinalize(current,oldMoves) && canFinalize(rebased,newMoves) && productDemand(oldMoves)===productDemand(newMoves)) {
+        if(!preserveRows && current.packingConfirmation && current.packingConfirmation.revision===quantityRevision(current) && current.packingConfirmation.baseline===quantityBaseline(oldMoves) && canFinalize(current,oldMoves) && canFinalize(rebased,newMoves) && productDemand(oldMoves)===productDemand(newMoves)) {
             rebased.packingConfirmation={...clone(current.packingConfirmation),revision:quantityRevision(rebased),baseline:quantityBaseline(newMoves)};
         }
         if (isSharedMode(current)) {
@@ -1038,7 +1105,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
                 const entryIsSheet = entry.source === "sheet_fallback";
                 if (existingIsSheet && entryIsSheet && Number(existing.quantity || 1) !== Number(entry.quantity || 1)) {
                     index.set(normalized, { source: "conflict", ambiguous: true, productIds: [Number(entry.productId)], reason: "box_quantity_conflict" });
-                } else if (entryIsSheet && !existingIsSheet) {
+                } else if (entryIsSheet && !existingIsSheet || !existingIsSheet && entry.source === "odoo_packaging" && existing.source !== "odoo_packaging") {
                     index.set(normalized, { ...entry, productId: Number(entry.productId) });
                 }
                 return;
@@ -1052,7 +1119,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
         }
         for (const item of systemCodes || []) {
             for (const code of parseCodeList(item.code)) {
-                add(code, { productId: item.productId, source: item.source || "odoo_alternate", field: item.field || "" });
+                add(code, { productId: item.productId, source: item.source || "odoo_alternate", field: item.field || "", quantity: item.quantity ?? 1 });
             }
         }
         for (const mapping of boxMappings || []) {
@@ -1178,9 +1245,9 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
     return {
         STATUS, STATUS_LABELS, normalizeCode, parseCodeList, safeParse, demandOf, createTech, hydrateTech,
         progress, nativeProgress, extraTotal, pendingOperationCounts, canFinalize, assertBaseline, statusFor, acquireLock, changePicker, verifyLock, findMoveForProduct,
-        isSharedMode, enableSharedMode, normalizeSharedEvent, replaySharedEvents, quantityRevision, quantityBaseline, restoreBulkSnapshot,
+        isSharedMode, enableSharedMode, normalizeSharedEvent, replaySharedEvents, quantityRevision, quantityBaseline, saleRevision, moveProvenance, compatibleProvenance, restoreBulkSnapshot,
         normalizeDraftLines, draftLineFingerprint, diffDraftLines, draftMoves, rebaseTechForMoves,
-        applyOperation, applyExtraOperation, recordUnknownScan, deleteUnknownScan, setException, productCodeIndex, parseCsv, isBoxMappingCsv, parseBoxMappingSheet, parseBoxMappings,
+        quantityIntent, applyOperation, applyExtraOperation, recordUnknownScan, deleteUnknownScan, setException, productCodeIndex, parseCsv, isBoxMappingCsv, parseBoxMappingSheet, parseBoxMappings,
         cameraGate, odooDateTime, makeId,
     };
 });
@@ -1190,7 +1257,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
 
 (function () {
 const PBFUL_MODE = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "desktop" : "workspace";
-const PBFUL_VERSION = "1.2.13";
+const PBFUL_VERSION = "1.2.18.8";
 
 (function () {
     "use strict";
@@ -1398,7 +1465,7 @@ function normalizeDashboardPreferences(record) {
         productQuery: "", productResults: [], productSearching: false, productSearchDone: false, productSearchError: "", productSearchTimer: null, productSearchSeq: 0, productSearchIndex: -1,
         productInputFocused: false, pickerDraft: null,
         scanOnly: loadJson("pbful_scan_only_v1", false) === true, scanAlert: null, quantityInputBurst: null, quantityBeforeInput: null,
-        quantityDrafts: new Map(), exceptionReasonDraft: "缺货", exceptionNoteDraft: "",
+        quantityDraftBases: new Map(), quantityDrafts: new Map(), exceptionReasonDraft: "缺货", exceptionNoteDraft: "",
         renderPending: false, pointerActive: false, moreOpen: false, promptQueue: [], activePrompt: null, requestNoticeKey: "", confirmingRequestId: null,
         posControlTimer: null, posReconcileTimer: null, posBusy: false, posLastUuid: "", posRequestCache: new Map(), posLookedUp: new Set(), posHooksInstalled: false, prepickReconciling: false, lastPrepickReconcileAt: 0,
         windowRect: loadJson(activeWindowKey, null), windowGesture: null, imagePreview: null,
@@ -1700,6 +1767,9 @@ function normalizeDashboardPreferences(record) {
     }
 
     function isScanTerminator(event) {
+        if (event?.key === "Tab" && !event.shiftKey && !event.isComposing && !event.ctrlKey && !event.altKey && !event.metaKey &&
+            !state.activePrompt && (state.scanInputCandidate?.fast || quantityBurstIsScan(state.quantityInputBurst) ||
+            state.scanBuffer?.length >= 3 || state.scanOnlyInput?.text?.length >= 3)) return true;
         return ["Enter", "Return", "\r", "\n"].includes(event?.key) ||
             ["Enter", "NumpadEnter"].includes(event?.code) || event?.keyCode === 13 || event?.which === 13 ||
             (["beforeinput", "input"].includes(event?.type) && ["insertLineBreak", "insertParagraph"].includes(event?.inputType));
@@ -1747,7 +1817,8 @@ function normalizeDashboardPreferences(record) {
             return false;
         }
 
-        const now = performance.now();
+        const stamp = event.timeStamp;
+        const now = Number.isFinite(stamp) && stamp > 0 ? stamp : performance.now();
         state.scanTerminatorHeld = false;
         state.scanSuffixUntil = 0;
         if (candidate.chars && now - candidate.lastAt > (candidate.fast ? HID_INCOMPLETE_RESET_MS : HID_MANUAL_FLUSH_MS)) resetScanInputCandidate(true);
@@ -2011,6 +2082,20 @@ function normalizeDashboardPreferences(record) {
         return records.filter(record => !["order_note", "sales_queue"].includes(Core.normalizeSharedEvent(record).op.scope));
     }
 
+    function verifyExistingOperation(record, op) {
+        const stored = Core.safeParse(record.x_pb_payload)?.op;
+        const canonical = value => {
+            if (Array.isArray(value)) return value.map(canonical);
+            if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])]));
+            return value;
+        };
+        const transport = new Set(["queuedAt","queuedOrigin","queuedOrder"]);
+        const matches = stored && Core.quantityIntent(stored)===Core.quantityIntent(op) && Object.keys(op).filter(key => !transport.has(key)).every(key =>
+            JSON.stringify(canonical(stored[key])) === JSON.stringify(canonical(op[key])));
+        if (!matches) throw Object.assign(new Error(pbUiText("操作编号相同，但原记录内容无法核对，请保留待同步记录并检查。","El identificador ya existe con datos distintos o ilegibles. Revise el registro pendiente.")), {code:"OPERATION_ID_CONFLICT"});
+        return { ...record, duplicate:true };
+    }
+
     async function createSharedEvent(op, detail, session, knownEvents = null) {
         await assertTaskListed(detail?.row);
         if (detail?.review) return createReviewEvent(op, detail, session, knownEvents);
@@ -2022,14 +2107,14 @@ function normalizeDashboardPreferences(record) {
         const existing = Array.isArray(knownEvents)
             ? knownEvents.filter(event => String(event.x_name || event.name || "") === String(op.id))
             : await searchRead(SHARED_EVENT_MODEL, domain, ["id", "x_name", "x_pb_status", "x_pb_error", "x_pb_payload"], { limit: 1 });
-        if (existing.length) return { ...existing[0], duplicate: true };
+        if (existing.length) return verifyExistingOperation(existing[0],op);
         const values = eventValuesForOperation(op, detail, session);
         try {
             const id = await rpc(SHARED_EVENT_MODEL, "create", [values]);
             return { id, ...values };
         } catch (error) {
             const retry = await searchRead(SHARED_EVENT_MODEL, domain, ["id", "x_name", "x_pb_status", "x_pb_error", "x_pb_payload"], { limit: 1 });
-            if (retry.length) return { ...retry[0], duplicate: true };
+            if (retry.length) return verifyExistingOperation(retry[0],op);
             throw error;
         }
     }
@@ -2443,7 +2528,7 @@ function legacyReviewReplay(events, snapshot) {
             const key = orderNoteKey(row), current = state.orderNotes.get(key) || { id: 0, text: "" };
             let draft = current.text, expectedId = current.id, operationId = Core.makeId("note");
             return await showPrompt(`${row.order.pos_reference || row.order.name}\n${t("orderNoteHelp")}`, "confirm", {
-                title: t("orderNoteTitle"), keepOpenOnError: true,
+                title: t("orderNoteTitle"), keepOpenOnError: true, fitNoteViewport: true,
                 textInput: { value: draft, placeholder: t("orderNotePlaceholder"), maxLength: 200, onInput(value) { draft = value; operationId = Core.makeId("note"); } },
                 actions: [
                     { label: t("orderNoteCancel"), value: false },
@@ -2658,6 +2743,33 @@ function legacyReviewReplay(events, snapshot) {
         return readPrepickTaskDetail(row);
     }
 
+    async function readScanCatalog(productIds) {
+        const fields = await discoverProductCodeFields();
+        const products = await readProductsByIds(productIds, fields);
+        return {products, systemCodes: await collectSystemCodes(products, fields)};
+    }
+
+    async function readPrepickStock(productIds, configId) {
+        let locationId = 0;
+        if (configId) {
+            const config = await readOne("pos.config", configId, ["picking_type_id"]);
+            const pickingTypeId = m2oId(config?.picking_type_id);
+            if (pickingTypeId) {
+                const pickingType = await readOne("stock.picking.type", pickingTypeId, ["default_location_src_id"]);
+                locationId = m2oId(pickingType?.default_location_src_id);
+            }
+        }
+        const quants = productIds.length && locationId ? await readAll("stock.quant", [
+            ["product_id", "in", productIds], ["location_id", "child_of", locationId],
+        ], ["id", "product_id", "quantity", "reserved_quantity"], 1000) : [];
+        const stock = new Map();
+        for (const quant of quants) {
+            const id = m2oId(quant.product_id);
+            stock.set(id, (stock.get(id) || 0) + Number(quant.quantity || 0));
+        }
+        return {stock, locationId};
+    }
+
     async function readPrepickTaskDetail(row) {
         const request = await readOne(PREPICK_MODEL, row.request.id, PREPICK_FIELDS);
         if (!request) throw Object.assign(new Error(pbUiText("预配货任务不存在或已删除","La tarea de presurtido no existe o fue eliminada.")), { code: "PREPICK_NOT_FOUND" });
@@ -2678,27 +2790,10 @@ function legacyReviewReplay(events, snapshot) {
         const tech = request.x_pb_change_pending ? storedTech : Core.isSharedMode(storedTech) ? Core.replaySharedEvents(storedTech, moves, sharedEvents) : storedTech;
         const orderProductIds = [...new Set(moves.map((move) => Number(move.product_id[0])))];
         const productIds = [...new Set([...orderProductIds, ...Object.entries(tech.extraCounts || {}).filter(([, qty]) => Number(qty) > 0).map(([id]) => Number(id))])];
-        const productCodeFields = await discoverProductCodeFields();
-        const products = await readProductsByIds(productIds, productCodeFields);
-        let locationId = 0;
-        const configId = m2oId(request.x_pb_config_id);
-        if (configId) {
-            const config = await readOne("pos.config", configId, ["picking_type_id"]);
-            const pickingTypeId = m2oId(config?.picking_type_id);
-            if (pickingTypeId) {
-                const pickingType = await readOne("stock.picking.type", pickingTypeId, ["default_location_src_id"]);
-                locationId = m2oId(pickingType?.default_location_src_id);
-            }
-        }
-        const quants = productIds.length && locationId ? await searchRead("stock.quant", [
-            ["product_id", "in", productIds], ["location_id", "child_of", locationId],
-        ], ["product_id", "quantity", "reserved_quantity"], { limit: 10000 }) : [];
-        const stock = new Map();
-        for (const quant of quants) {
-            const id = m2oId(quant.product_id);
-            stock.set(id, (stock.get(id) || 0) + Number(quant.quantity || 0));
-        }
-        const systemCodes = await collectSystemCodes(products, productCodeFields);
+        const [{products, systemCodes}, {stock, locationId}] = await Promise.all([
+            readScanCatalog(productIds),
+            readPrepickStock(productIds, m2oId(request.x_pb_config_id)),
+        ]);
         const odooCodeCount = new Set(systemCodes.flatMap((item) => Core.parseCodeList(item.code))).size;
         const boxCodeCount = new Set(state.boxMappings.filter((item) => item.enabled).map((item) => Core.normalizeCode(item.boxCode)).filter(Boolean)).size;
         return {
@@ -2770,20 +2865,35 @@ function legacyReviewReplay(events, snapshot) {
     }
 
     function productReadFields(codeFields = state.productCodeFields || []) {
-        return ["id", "display_name", "default_code", "barcode", "tracking", "product_tmpl_id", ...codeFields];
+        return ["id", "display_name", "default_code", "barcode", "tracking", "product_tmpl_id", "uom_id", ...codeFields];
     }
 
     async function readProductsByIds(productIds, codeFields) {
         if (!productIds.length) return [];
         try {
-            return await searchRead("product.product", [["id", "in", productIds]], productReadFields(codeFields), { limit: 1000 });
+            return await readAll("product.product", [["id", "in", productIds]], productReadFields(codeFields), 1000);
         } catch (error) {
             if (isNetworkError(error)) throw error;
             state.productCodeFields = [];
             state.productCodeFieldLabels = {};
             state.productCodeFieldDefs = {};
-            return searchRead("product.product", [["id", "in", productIds]], productReadFields([]), { limit: 1000 });
+            return readAll("product.product", [["id", "in", productIds]], productReadFields([]), 1000);
         }
+    }
+
+    async function resolveUomBarcodes(rows, products) {
+        if (!rows.length) return [];
+        const baseUnits = new Map(products.map(p => [p.id,m2oId(p.uom_id)]));
+        const ids = [...new Set([...rows.map(r => m2oId(r.uom_id)),...baseUnits.values()].filter(Boolean))];
+        const units = await searchRead("uom.uom",[["id","in",ids]],["id","factor"],{limit:ids.length});
+        const factors = new Map(units.map(u => [u.id,Number(u.factor)]));
+        return rows.map(r => {
+            const productId = m2oId(r.product_id);
+            const ratio = factors.get(m2oId(r.uom_id))/factors.get(baseUnits.get(productId));
+            const qty = Math.round(ratio);
+            return { productId, code:r.barcode, source:"odoo_packaging", field:"product.uom.barcode",
+                quantity:Number.isSafeInteger(qty) && qty>0 && qty<=9999 && Math.abs(ratio-qty)<1e-9 ? qty : 0 };
+        });
     }
 
     async function lookupProductUomCodeMatches(code, operator = "=") {
@@ -2791,7 +2901,8 @@ function legacyReviewReplay(events, snapshot) {
             const defs = await fieldsOf("product.uom");
             if (!defs.barcode || defs.product_id?.relation !== "product.product") return [];
             const rows = await searchRead("product.uom", [["barcode", operator, code], ["product_id", "!=", false]], ["id", "barcode", "product_id", "uom_id"], { limit: 50 });
-            return rows.map(row => ({ productId: m2oId(row.product_id), code: row.barcode })).filter(row => row.productId);
+            const products = await readProductsByIds([...new Set(rows.map(r => m2oId(r.product_id)))], []);
+            return await resolveUomBarcodes(rows,products);
         } catch (error) {
             if (isNetworkError(error)) throw error;
             return [];
@@ -2850,10 +2961,10 @@ function legacyReviewReplay(events, snapshot) {
                     return searchRead("product.product", basicDomain, productReadFields([]), { limit: 50 });
                 }
             })(),
-            Promise.all(searchCodes.map(async candidate => ({ code: candidate, ids: await lookupPackagingProductIds(candidate) }))),
+            Promise.all(searchCodes.map(async candidate => ({ code: candidate, matches: await lookupPackagingCodeMatches(candidate) }))),
         ]);
         const relatedCodes = new Map();
-        for (const group of relatedGroups) for (const id of group.ids) {
+        for (const group of relatedGroups) for (const {productId:id} of group.matches) {
             if (!relatedCodes.has(id)) relatedCodes.set(id, new Set());
             relatedCodes.get(id).add(group.code);
         }
@@ -2868,7 +2979,7 @@ function legacyReviewReplay(events, snapshot) {
             const sheetQuantities = [...new Set(matchingSheetRows.map((mapping) => Number(mapping.quantity || 1)))];
             if (sheetQuantities.length > 1) return { ambiguous: true, productIds: [product.id], reason: "box_quantity_conflict" };
             if (matchingSheetRows.length) candidates.set(product.id, { product, source: "sheet_fallback", quantity: sheetQuantities[0] || 1 });
-            else if (direct) candidates.set(product.id, { product, source: relatedCodes.get(Number(product.id))?.has(code) ? "odoo_packaging" : "odoo_product", quantity: 1 });
+            else if (direct) candidates.set(product.id, { product, source: relatedCodes.get(Number(product.id))?.has(code) ? "odoo_packaging" : "odoo_product", quantity: relatedGroups.find(g => g.code===code)?.matches.find(m => m.productId===product.id)?.quantity ?? 1 });
         }
         if (candidates.size > 1) return { ambiguous: true, productIds: [...candidates.keys()] };
         return candidates.values().next().value || null;
@@ -2962,13 +3073,8 @@ function legacyReviewReplay(events, snapshot) {
             const defs = await fieldsOf("product.uom");
             if (!defs.barcode || defs.product_id?.relation !== "product.product") return [];
             const productIds = products.map((item) => item.id);
-            const rows = await searchRead("product.uom", [["product_id", "in", productIds], ["barcode", "!=", false]], ["id", "barcode", "product_id", "uom_id"], { limit: 5000 });
-            return rows.map((row) => ({
-                code: row.barcode,
-                productId: Array.isArray(row.product_id) ? row.product_id[0] : row.product_id,
-                source: "odoo_packaging",
-                field: "product.uom.barcode",
-            })).filter((item) => item.productId);
+            const rows = await readAll("product.uom", [["product_id", "in", productIds], ["barcode", "!=", false]], ["id", "barcode", "product_id", "uom_id"], 1000);
+            return await resolveUomBarcodes(rows,products);
         } catch (error) {
             if (isNetworkError(error)) throw error;
             return [];
@@ -3087,7 +3193,14 @@ function legacyReviewReplay(events, snapshot) {
         if (!m2oId(source.location_id) || m2oId(source.location_id) !== m2oId(target.location_id))
             throw bridgeError('销售与 POS 发货仓库不同，已阻止自动关联。', 'Los almacenes de venta y POS son distintos.');
         assertBridgeQuantity(bridgeMoveLines(sourceMoves), targetMoves);
-        const units = moves => [...new Set(moves.filter(m=>Core.demandOf(m)>0).map(m => `${m2oId(m.product_id)}:${m2oId(m.product_uom)}`))].sort().join('|');
+        const units = moves => {
+            const totals = new Map();
+            for (const move of moves.filter(m => Core.demandOf(m)>0)) {
+                const key = [m2oId(move.product_id), m2oId(move.product_uom)].join(':');
+                totals.set(key, (totals.get(key) || 0) + Core.demandOf(move));
+            }
+            return JSON.stringify([...totals].sort(([a],[b])=>a.localeCompare(b)));
+        };
         if (units(sourceMoves) !== units(targetMoves)) throw bridgeError('销售与 POS 商品单位不一致。', 'Las unidades de medida no coinciden.');
     }
     async function bridgeForSource(id) {
@@ -3167,13 +3280,72 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
     return true;
 }
 
+    // Financial refunds can exist before the goods arrive. Require dated native
+    // move lines, in the same location pair and base unit, for each paid order.
+    async function repaidStockReturned(snapshot, sale, priorLines, priorOrders, discountProductId) {
+        const sold = priorLines.filter(l=>l.qty>0 && m2oId(l.product_id)!==discountProductId);
+        if (!sold.length) return false;
+        const refundIds = [...new Set(sold.flatMap(l=>l.refund_orderline_ids || []))];
+        if (!refundIds.length) return false;
+        const refunds = await readAll('pos.order.line',[['id','in',refundIds]],['order_id','product_id','qty','refunded_orderline_id']);
+        const products = await readAll('product.product',[['id','in',[...new Set(sold.map(l=>m2oId(l.product_id)))]]],['uom_id','tracking']);
+        const base = new Map(products.map(p=>[p.id,m2oId(p.uom_id)]));
+        if (products.some(p=>p.tracking!=='none')) return false;
+        for (const line of sold) {
+            const linked = refunds.filter(r=>m2oId(r.refunded_orderline_id)===line.id);
+            if (!linked.length || linked.some(r=>r.qty>=0 || m2oId(r.product_id)!==m2oId(line.product_id)) ||
+                linked.reduce((q,r)=>q-r.qty,0)!==line.qty) return false;
+        }
+        const refundOrders = [...new Set(refunds.map(r=>m2oId(r.order_id)))];
+        const paid = await readAll('pos.order',[['id','in',[...new Set([...priorOrders.map(o=>o.id),...refundOrders])]]],
+            ['state','config_id','picking_ids','company_id']);
+        const config=await readOne('pos.config',snapshot.configId,['picking_type_id']);
+        const type=await readOne('stock.picking.type',m2oId(config?.picking_type_id),['warehouse_id','default_location_src_id','default_location_dest_id']);
+        if (!type || m2oId(type.warehouse_id)!==m2oId(sale.warehouse_id)) return false;
+        const src=m2oId(type.default_location_src_id),dst=m2oId(type.default_location_dest_id);
+        if (!src || !dst || src===dst) return false;
+        const expected=new Map();
+        for (const l of [...sold,...refunds]) {
+            const id=m2oId(l.order_id),p=m2oId(l.product_id);
+            if (!expected.has(id)) expected.set(id,new Map());
+            const sums=expected.get(id); sums.set(p,(sums.get(p)||0)+l.qty);
+        }
+        // Extra returns created from native transfers can coexist with a POS
+        // refund. An additional or pending reverse move needs physical review.
+        const receiptIds = [...new Set(paid.flatMap(o=>o.picking_ids))];
+        if (receiptIds.length) {
+            const reverse = await searchRead('stock.picking',[['return_id','in',receiptIds],['id','not in',receiptIds],['state','!=','cancel']],['id'],{limit:1});
+            if (reverse.length) return false;
+        }
+        for (const [orderId, expectedQty] of expected) {
+            const order=paid.find(o=>o.id===orderId);
+            if (!order || !posPaymentConfirmed(order) || m2oId(order.config_id)!==snapshot.configId ||
+                m2oId(order.company_id)!==m2oId(sale.company_id) || !order.picking_ids.length) return false;
+            const picks=await readAll('stock.picking',[['id','in',order.picking_ids]],['state','pos_order_id','date_done']);
+            if (picks.length!==order.picking_ids.length || picks.some(p=>m2oId(p.pos_order_id)!==orderId || !['done','cancel'].includes(p.state))) return false;
+            const done=picks.filter(p=>p.state==='done' && p.date_done).map(p=>p.id);
+            if (!done.length) return false;
+            const rows=await readAll('stock.move.line',[['picking_id','in',done]],['product_id','product_uom_id','location_id','location_dest_id','quantity','state','owner_id','lot_id']);
+            const remaining=new Map(expectedQty);
+            const returning=refundOrders.includes(orderId);
+            for (const row of rows) {
+                const p=m2oId(row.product_id);
+                if (row.state!=='done' || row.quantity<=0 || !remaining.has(p) || !base.get(p) ||
+                    m2oId(row.product_uom_id)!==base.get(p) || row.lot_id || row.owner_id ||
+                    m2oId(row.location_id)!==(returning?dst:src) || m2oId(row.location_dest_id)!==(returning?src:dst)) return false;
+                remaining.set(p,remaining.get(p)+(returning?row.quantity:-row.quantity));
+            }
+            if ([...remaining.values()].some(n=>n!==0)) return false;
+        }
+        return true;
+    }
     async function pbUsePosPrepickForRepaidSale(snapshot) {
         if(snapshot.saleIds.length!==1 || snapshot.hasUnlinkedLines) return false;
         const saleId=snapshot.saleIds[0];
-        const sale=await readOne('sale.order',saleId,['id','state']);
+        const sale=await readOne('sale.order',saleId,['id','state','company_id','warehouse_id']);
         if(sale?.state!=='sale') return false;
         const salePickings=await searchRead('stock.picking',
-            [['sale_id','=',saleId],['picking_type_code','=','outgoing']],['id'],{limit:1});
+            [['sale_id','=',saleId],['picking_type_code','=','outgoing'],['state','!=','cancel']],['id'],{limit:1});
         if(salePickings.length) return false;
         const config=await readOne('pos.config',snapshot.configId,['discount_product_id']);
         const discountProductId=m2oId(config?.discount_product_id);
@@ -3185,13 +3357,13 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         const productTypes=new Map(products.map(product=>[product.id,product.type]));
         if(productIds.some(id=>!productTypes.has(id))) return false;
         const priorLines=await readAll('pos.order.line',[['sale_order_origin_id','=',saleId]],
-            ['id','order_id','product_id','sale_order_line_id','qty','refunded_qty'],1000);
+            ['id','order_id','product_id','sale_order_line_id','qty','refunded_qty','refund_orderline_ids'],1000);
         const orderIds=[...new Set(priorLines.map(line=>m2oId(line.order_id)).filter(Boolean))];
         const priorOrders=orderIds.length?await readAll('pos.order',[['id','in',orderIds]],
             ['id','state','config_id'],1000):[];
         return pbCanUsePosPrepickForRepaidSale({snapshot,
             saleLines:saleLines.map(line=>({...line,service:productTypes.get(m2oId(line.product_id))==='service'})),
-            priorLines,priorOrders,discountProductId});
+            priorLines,priorOrders,discountProductId}) && await repaidStockReturned(snapshot,sale,priorLines,priorOrders,discountProductId);
     }
     async function prepareSaleBridge(order, snapshot = posOrderSnapshot(order)) {
         if (snapshot.saleIds.length !== 1 || snapshot.hasUnlinkedLines) throw bridgeError('配货收款只支持一张完整销售单；请分开混合商品或多张销售单。', 'Use una sola venta completa; separe las ventas o productos mezclados.');
@@ -3214,13 +3386,16 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         // Preparing a picking task never guards or submits native payment.
         rememberPrepickMarker(snapshot.uuid, { paymentRequired: true });
         const saleId = snapshot.saleIds[0];
+        await discoverFields();
         const rows = await loadSalesRows(saleId);
         if(!rows.some(row=>!['done','cancel'].includes(row.picking.state)))throw bridgeError(
             '来源销售单没有可用的待发交货单。请核对交货单是否已完成、取消或不可读取；未将此情况当作商品数量差异。',
             'La venta no tiene una entrega pendiente disponible. Revise si está completada, cancelada o no es accesible; no se trata como una diferencia de cantidades.');
         const candidates = [];
         for (const row of rows.filter(r => !['done','cancel'].includes(r.picking.state))) {
-            const detail = await loadDetail(row);
+            await assertTaskListed(row);
+            const detail = await readDeliveryTaskSnapshot(row);
+            await publishLoadedTaskStatus(detail);
             try { assertBridgeQuantity(snapshot.lines, detail.moves); candidates.push(detail); } catch (error) { if (error.code !== 'FULFILLMENT_BRIDGE') throw error; }
         }
         if (candidates.length !== 1) throw bridgeError(candidates.length > 1
@@ -3241,7 +3416,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         if(!posType||!saleType||!m2oId(posType.warehouse_id)||m2oId(posType.warehouse_id)!==m2oId(saleType.warehouse_id)||m2oId(posType.default_location_src_id)!==m2oId(detail.picking.location_id))throw bridgeError('此 POS 发货仓库与销售交货单不同。', 'Este POS utiliza otro almacén de entrega.');
         const enrollment = await searchRead(SHARED_EVENT_MODEL, [['x_pb_operation','=',SALES_QUEUE_OPERATION],['x_pb_picking_id','=',sourceId]], ['id'], {limit:2});
         if (!enrollment.length) await rpc(SHARED_EVENT_MODEL, 'create', [{x_name:`sales-register:${sourceId}`,x_pb_picking_id:sourceId,x_pb_operation:SALES_QUEUE_OPERATION,x_pb_status:'done',x_pb_payload:JSON.stringify({op:{scope:'sales_queue',type:'add',id:`sales-register:${sourceId}`},version:VERSION})}]);
-        const data = {schema:1,saleId,sourcePickingId:sourceId,sourceName:detail.picking.name,sourceMoves:detail.moves,sourceBaseline:Core.quantityBaseline(detail.moves),posFingerprint:snapshot.fingerprint,preparedAt:new Date().toISOString()};
+        const data = {schema:1,saleId,sourcePickingId:sourceId,sourceName:detail.picking.name,sourceMoves:detail.moves,saleProof:await bridgeSaleProof(saleId),sourceBaseline:Core.quantityBaseline(detail.moves),posFingerprint:snapshot.fingerprint,preparedAt:new Date().toISOString()};
         const values = {x_name:detail.row.order.name,x_pb_order_uuid:snapshot.uuid,x_pb_picking_id:sourceId,x_pb_state:'bridge_wait',x_pb_lines:JSON.stringify(snapshot.lines),x_pb_payload:JSON.stringify({fulfillmentBridge:data}),x_pb_config_id:snapshot.configId,x_pb_session_id:snapshot.sessionId,x_pb_customer:snapshot.customer,x_pb_amount:snapshot.amount,x_pb_requested_by:snapshot.requestedBy,x_pb_requested_at:Core.odooDateTime(data.preparedAt),x_pb_version:Number(existing?.x_pb_version||0)+1};
         let record;
         if (existing) { await rpc(PREPICK_MODEL,'write',[[existing.id],values]); record={...existing,...values}; }
@@ -3256,6 +3431,46 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         prepickSaved();
         return record;
     }
+    // A paid POS may cancel its sale delivery. That historical move stops
+    // changing, while the sale line can still be edited on another terminal.
+    async function bridgeSaleProof(saleId) {
+        const sale = await readOne('sale.order',saleId,['state','warehouse_id','company_id','partner_id']);
+        if (!sale) throw bridgeError('无法读取来源销售单。','No se pudo leer la venta de origen.');
+        const lines = await readAll('sale.order.line',[['order_id','=',saleId],['display_type','=',false]],
+            ['product_id','product_uom_qty','product_uom_id']);
+        const ids = [...new Set(lines.map(l=>m2oId(l.product_id)).filter(Boolean))];
+        const products = ids.length ? await readAll('product.product',[['id','in',ids]],['type']) : [];
+        const types = new Map(products.map(p=>[p.id,p.type]));
+        if (ids.some(id=>!types.has(id))) throw bridgeError('部分来源商品无法读取。','Faltan productos de la venta de origen.');
+        const goods = lines.filter(l=>types.has(m2oId(l.product_id)) && types.get(m2oId(l.product_id))!=='service')
+            .map(l=>[l.id,m2oId(l.product_id),m2oId(l.product_uom_id),Number(l.product_uom_qty)]).sort((a,b)=>a[0]-b[0]);
+        return {state:sale.state,warehouse:m2oId(sale.warehouse_id),company:m2oId(sale.company_id),customer:m2oId(sale.partner_id),goods};
+    }
+    async function assertPaidSaleProof(data, sourcePicking, currentMoves, posLines) {
+        const proof = await bridgeSaleProof(data.saleId);
+        const stale = () => bridgeError('付款已完成，来源销售单与配货记录不再一致。请比较销售单、已付款 POS 和原生交货单，按实物处理；请勿再次收款。',
+            'Pago completado. Cambió la venta de origen. Compare la venta, el POS pagado y la entrega en Odoo antes de continuar. No vuelva a cobrar.');
+        if (proof.state!=='sale') throw stale();
+        if (data.saleProof) {
+            if (JSON.stringify(data.saleProof)!==JSON.stringify(proof)) throw stale();
+            return;
+        }
+        // A legacy bridge has no frozen sale. Accept only a fully provable,
+        // single-sale match in native sale-line units; ambiguous splits need review.
+        const original = new Map(data.sourceMoves.map(m=>[m.id,m]));
+        const paidLines = new Set(posLines.map(l=>m2oId(l.sale_order_line_id)).filter(Boolean));
+        const sums = new Map();
+        for (const live of currentMoves) {
+            const old = original.get(live.id), line = m2oId(live.sale_line_id);
+            if (!old || !line || !paidLines.has(line)) throw stale();
+            const key = [line,m2oId(old.product_id),m2oId(old.product_uom)].join(':');
+            sums.set(key,(sums.get(key)||0)+Core.demandOf(old));
+        }
+        if (sums.size!==proof.goods.length || proof.goods.some(([line,p,u,n])=>sums.get([line,p,u].join(':'))!==n)) throw stale();
+        const type=await readOne('stock.picking.type',m2oId(sourcePicking.picking_type_id),['warehouse_id']);
+        if (!type || m2oId(type.warehouse_id)!==proof.warehouse ||
+            currentMoves.some(m=>m2oId(m.company_id)!==proof.company) || m2oId(sourcePicking.partner_id)!==proof.customer) throw stale();
+    }
     async function resolveSaleBridge(record, sourcePicking, currentMoves) {
         const data = bridgePayload(record);
         if (!data || data.sourcePickingId !== sourcePicking.id) throw bridgeError('销售配货关联校验失败。', 'No se pudo verificar el vínculo de surtido.');
@@ -3267,8 +3482,21 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             return {record,data,paid:false};
         }
         if (!posOrder.shipping_date) throw bridgeError('POS 未使用稍后发运，请核对实际库存，不自动再次出库。', 'El POS no tiene envío posterior; revise el inventario antes de continuar.');
-        const lines = await readAll('pos.order.line', [['order_id','=',posOrder.id]], ['product_id','qty','sale_order_origin_id'],1000);
+        const liveById = new Map(currentMoves.map(m => [m.id, m]));
+        if (m2oId(sourcePicking.sale_id) !== data.saleId ||
+            !Array.isArray(data.sourceMoves) || data.sourceMoves.length !== liveById.size ||
+            data.sourceMoves.some(saved => {
+                const live = liveById.get(saved.id);
+                return !live || m2oId(saved.product_id) !== m2oId(live.product_id) ||
+                    Core.demandOf(saved) !== Core.demandOf(live) ||
+                    !Core.compatibleProvenance(Core.moveProvenance(saved),Core.moveProvenance(live));
+            })) {
+            throw bridgeError('付款已完成，来源交货明细已变。请打开销售单和已付款 POS 的交货记录逐行核对，再到原生交货单处理。',
+                'Pago completado. Cambiaron las líneas de origen. Compare las entregas de la venta y del POS pagado y continúe en la entrega original de Odoo.');
+        }
+        const lines = await readAll('pos.order.line', [['order_id','=',posOrder.id]], ['product_id','qty','sale_order_origin_id','sale_order_line_id'],1000);
         if (lines.some(l=>m2oId(l.sale_order_origin_id)!==data.saleId)) throw bridgeError('POS 来源销售单不一致。', 'No coincide la venta de origen del POS.');
+        await assertPaidSaleProof(data,sourcePicking,currentMoves,lines);
         assertBridgeQuantity(await paidBridgeGoodsLines(lines),data.sourceMoves);
         const picks = await searchRead('stock.picking',[['pos_order_id','=',posOrder.id],['picking_type_code','=','outgoing'],['state','!=','cancel']],['id','name','state','date_done','location_id','picking_type_id'],{limit:100});
         if (picks.length !== 1) throw bridgeError('付款已完成，但交货单尚未唯一确定，请同步后核对。不要再次付款。', 'Pago completado; la entrega aún no es única. Sincronice y revise. No vuelva a pagar.');
@@ -3336,7 +3564,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
     // Both entrances use the same stock-out guard; the task source decides payment rules.
     const canValidateHere = (detail = state.detail) => Boolean(detail);
     function baselineMoves(tech) {
-        return Object.entries(tech?.baseline || {}).map(([id, b]) => ({id:Number(id), product_id:Number(b.productId), product_uom_qty:Number(b.demand)}));
+        return Object.entries(tech?.baseline || {}).map(([id, b]) => ({...b.identity,id:Number(id), product_id:Number(b.productId), product_uom_qty:Number(b.demand)}));
     }
     function saleChanged(detail) {
         return isSale(detail) && !Core.assertBaseline(detail.tech, detail.moves).ok;
@@ -3408,20 +3636,20 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
     async function confirmSalesChange(confirmed=false, expectedMoves=null) {
         const prior=state.detail;
         if(!isSale(prior)||!state.session)return toast(t('bulkStartFirst'),'warn');
-        const target=Core.quantityBaseline(prior.moves);
+        const target=Core.saleRevision(prior.moves);
         const token=state.session.token;
         if(expectedMoves && expectedMoves!==target)throw Object.assign(new Error(t('saleStale')),{code:'ORDER_CHANGED'});
         if(!confirmed && !await showPrompt(t('changedHelp'),'confirm',{title:t('orderChanged'),confirmLabel:t('confirmChange')}))return;
         await withDeviceMutationLock(prior.picking.id,async()=>{
             const fresh=await loadDetail(prior.row);
             if(state.detail?.picking.id!==prior.picking.id || state.session?.token!==token)throw Object.assign(new Error(t('saleStale')),{code:'ORDER_CHANGED'});
-            if(Core.quantityBaseline(fresh.moves)!==target || isReadOnlyDetail(fresh)){state.detail=fresh;render();throw Object.assign(new Error(t('saleStale')),{code:'ORDER_CHANGED'});}
+            if(Core.saleRevision(fresh.moves)!==target || isReadOnlyDetail(fresh)){state.detail=fresh;render();throw Object.assign(new Error(t('saleStale')),{code:'ORDER_CHANGED'});}
             if(!saleChanged(fresh)) {state.detail=fresh;render();return;}
-            const op={id:Core.makeId('review'),scope:'sales_review',type:'confirm',pickingId:fresh.picking.id,expectedBaseline:Core.quantityBaseline(baselineMoves(fresh.tech)),moves:fresh.moves.map(m=>({id:m.id,product_id:m2oId(m.product_id),product_uom_qty:Core.demandOf(m)}))};
+            const op={id:Core.makeId('review'),scope:'sales_review',type:'confirm',allocation:'move-v1',pickingId:fresh.picking.id,expectedBaseline:Core.quantityBaseline(baselineMoves(fresh.tech)),moves:fresh.moves.map(m=>({...Core.moveProvenance(m),id:m.id,product_id:m2oId(m.product_id),product_uom_qty:Core.demandOf(m)}))};
             await createSharedEvent(op,fresh,state.session);
             state.detail=fresh;
             await syncSharedState({expectedEventId:op.id,writeAggregate:true});
-            state.quantityDrafts.clear();state.lastAction=null;saveUndoRecord(fresh.picking.id,null);render();
+            state.quantityDraftBases.clear(); state.quantityDrafts.clear();state.lastAction=null;saveUndoRecord(fresh.picking.id,null);render();
         });
     }
     async function acknowledgeSalesCancellation() {
@@ -3481,7 +3709,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         if(!isSale(d))return '';
         const meta=`<div class="pbful-sale-meta">${t('salesOrders')} · ${esc(d.row.order.name)} · ${t('salesperson')}：${esc(d.row.order.user_id?.[1]||t('unassigned'))}</div>`;
         if(d.picking.state==='cancel')return meta+(d.salesCancelAck?'':cancellationBanner(d,'sale-cancel-ack'));
-        if(saleChanged(d)&&d.picking.state!=='done')return meta+`<section class="pbful-critical-banner changed" role="status"><div><strong>${t('orderChanged')}</strong><p>${t('saleStale')}</p><pre>${esc(salesChangeSummary(d))}</pre>${noticeError(d,'sale-confirm')}</div>${noticeButton(d,'sale-confirm',t('confirmChange'),`data-sales-baseline="${esc(Core.quantityBaseline(d.moves))}"`)}</section>`;
+        if(saleChanged(d)&&d.picking.state!=='done')return meta+`<section class="pbful-critical-banner changed" role="status"><div><strong>${t('orderChanged')}</strong><p>${t('saleStale')}</p><pre>${esc(salesChangeSummary(d))}</pre>${noticeError(d,'sale-confirm')}</div>${noticeButton(d,'sale-confirm',t('confirmChange'),`data-sales-baseline="${esc(Core.saleRevision(d.moves))}"`)}</section>`;
         return meta;
     }
 
@@ -3569,16 +3797,24 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         const byOrder = new Map(orders.filter(o => ['sale', 'cancel'].includes(o.state)).map(o => [o.id, o]));
         const byPicking = new Map(picks.filter(p => byOrder.has(m2oId(p.sale_id))).map(p => [p.id, pickingSummaryRow(p, byOrder.get(m2oId(p.sale_id)), 'sale')]));
         const visible=ids.map(id=>byPicking.get(id)).filter(row=>row&&row.picking.state!=='cancel'&&row.order.state!=='cancel');
-        const nativeMoves=visible.length?await readAll('stock.move',[['picking_id','in',visible.map(r=>r.picking.id)],['state','!=','cancel']],['id','picking_id','product_id','product_uom_qty','quantity','state'],1000, readOptions):[];
-        const splitIds=visible.filter(r=>m2oId(r.picking.backorder_id)).map(r=>r.picking.id);
-        const techs=splitIds.length?await searchRead('stock.picking',[['id','in',splitIds]],['id',state.fieldMap.tech],{limit:splitIds.length}, readOptions):[];
-        for(const row of visible){
-            const moves=nativeMoves.filter(m=>m2oId(m.picking_id)===row.picking.id);
-            if(row.picking.state==='done')applyDeliverySummary(row,moves);
-            else if(m2oId(row.picking.backorder_id)){
-                const raw=Core.safeParse(techs.find(p=>p.id===row.picking.id)?.[state.fieldMap.tech]);
-                applyDeliverySummary(row,moves,raw);
-            }
+        const summaries = visible.filter(row => row.picking.state === 'done' || m2oId(row.picking.backorder_id));
+        const splitIds = summaries.filter(row => row.picking.state !== 'done').map(row => row.picking.id);
+        const [moves, techs] = await Promise.all([
+            summaries.length ? readAll('stock.move', [['picking_id','in',summaries.map(row => row.picking.id)],['state','!=','cancel']],
+                ['id','picking_id','product_id','product_uom_qty','quantity','state'], 1000, readOptions) : [],
+            splitIds.length ? searchRead('stock.picking', [['id','in',splitIds]], ['id',state.fieldMap.tech], {limit:splitIds.length}, readOptions) : [],
+        ]);
+        const byPickingId = new Map();
+        for (const move of moves) {
+            const id = m2oId(move.picking_id);
+            if (!byPickingId.has(id)) byPickingId.set(id, []);
+            byPickingId.get(id).push(move);
+        }
+        const techById = new Map(techs.map(picking => [picking.id, picking[state.fieldMap.tech]]));
+        for (const row of summaries) {
+            const lines = byPickingId.get(row.picking.id) || [];
+            if (row.picking.state === 'done') applyDeliverySummary(row, lines);
+            else applyDeliverySummary(row, lines, Core.safeParse(techById.get(row.picking.id)));
         }
         return visible;
     }
@@ -3645,7 +3881,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         const button = document.getElementById('pbful-open-sale'); if (button) button.disabled = true;
         try {
             const sale = await readOne('sale.order', id, ['id', 'state', 'name']);
-            if (!sale || !['sale', 'cancel'].includes(sale.state)) return showPrompt(t('saleConfirmFirst'), 'warn');
+            if (!sale || !['sale', 'cancel'].includes(sale.state)) return showPrompt(t('saleConfirmFirst'), 'info', {title: t('openSalePicking')});
             cancelDetailRead();cancelDashboardRead();
             state.open = true; state.view = 'dashboard'; state.detail=null;state.session=null;state.postpaidMode=false;state.workspacePage='orders';state.orderSource = 'sale';
             state.salesperson = 'all'; state.warehouse = '__all__'; state.search = ''; render();
@@ -3656,7 +3892,14 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             const registered = new Set(enrolled.map(r => m2oId(r.x_pb_picking_id)));
             const choices = rows.filter(r => registered.has(r.picking.id) || (sale.state === 'sale' && !['done', 'cancel'].includes(r.picking.state)));
             if (!choices.length) { state.view = 'dashboard'; render(); return showPrompt(t('saleNoDelivery'), 'warn'); }
-            if (choices.length === 1) return await registerSalePicking(choices[0]);
+            if (choices.length === 1) {
+                const row = choices[0];
+                if (!registered.has(row.picking.id)) return await registerSalePicking(row);
+                // This shortcut just read the source order, outgoing picking and enrollment.
+                // openOrder still checks withdrawal and loads the current native documents.
+                state.rows = [...state.rows.filter(item => item.key !== row.key), row];
+                return await openOrder(row.key);
+            }
             state.view = 'dashboard'; render();
             await showPrompt(sale.name, 'info', {title: t('chooseDelivery'), actions: choices.map(row => ({
                 label: `${row.picking.name} · ${m2oName(row.picking.picking_type_id)} · ${statusLabel(row.status)} · ${t(registered.has(row.picking.id) ? 'saleOpenExisting' : 'openSalePicking')}`,
@@ -3981,8 +4224,21 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         rememberPrepickMarker(order.uuid,{requestId:request.id,state:sourceOverride?'bridge_done':'linked',posOrderId:order.id,pickingIds:ids});
         return {linked:true,pickingIds:ids};
     }
+    function cancelledUnpaidCart(orders) {
+        if (orders.length !== 1) return false;
+        const order = orders[0];
+        return order.state === 'cancel' && Array.isArray(order.payment_ids) && !order.payment_ids.length &&
+            Array.isArray(order.picking_ids) && !order.picking_ids.length;
+    }
     async function reconcilePaidBridge(request) {
-        const orders=await searchRead('pos.order',[['uuid','=',request.x_pb_order_uuid]],['id','uuid','state','picking_ids'],{limit:2});
+        if (request.x_pb_state === 'bridge_detached') return {skipped:true};
+        const orders=await searchRead('pos.order',[['uuid','=',request.x_pb_order_uuid]],['id','uuid','state','picking_ids','payment_ids'],{limit:2});
+        if (request.x_pb_state === 'bridge_wait' && cancelledUnpaidCart(orders)) {
+            await cancelPrepickForOrder({uuid:request.x_pb_order_uuid}, 'cancelled_bridge_reconcile', {
+                uuid:request.x_pb_order_uuid, requestId:request.id,
+            });
+            return {cancelled:true};
+        }
         if(orders.length!==1||!posPaymentConfirmed(orders[0]))return {pending:true};
         const order=orders[0],picks=await searchRead('stock.picking',[
             '|',['pos_order_id','=',order.id],['id','in',(order.picking_ids||[]).map(m2oId)],
@@ -4144,9 +4400,16 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         ],readOptions);
         if (!picking) throw new Error(state.lang === "es" ? "La entrega ya no existe o no está disponible" : "交货单已不存在或无法访问");
         let moves = await readAll("stock.move", [["picking_id", "=", picking.id], ...(isSale(row) && picking.state === "cancel" ? [] : [["state", "!=", "cancel"]])], [
-            "id", "picking_id", "product_id", "product_uom_qty", "quantity", "product_uom", "has_tracking", "picked", "state", "write_date",
+            "id", "picking_id", "product_id", "product_uom_qty", "quantity", "product_uom", "has_tracking", "picked", "state", "write_date", "company_id", "location_id", "location_dest_id", ...(isSale(row) ? ["sale_line_id"] : []),
         ], 1000,readOptions);
-        if(isSale(row)) { const link=picking; if(m2oId(link?.sale_id)!==row.order.id || link.picking_type_code!=="outgoing")throw new Error(t("saleNoDelivery")); const sale=await readOne("sale.order",row.order.id,["id","name","state","user_id","partner_id","client_order_ref"]); if(!sale)throw new Error(t("saleNoDelivery")); row={...row,order:{...row.order,...sale}}; if(sale.state!=="sale" && picking.state!=="done")picking.state="cancel"; }
+        if (isSale(row)) {
+            if (m2oId(picking.sale_id) !== row.order.id || m2oId(picking.pos_order_id) || picking.picking_type_code !== "outgoing")
+                throw new Error(t("saleNoDelivery"));
+            const sale = await readOne("sale.order", row.order.id, ["id","name","state","user_id","partner_id","client_order_ref"], readOptions);
+            if (!sale) throw new Error(t("saleNoDelivery"));
+            row = {...row, order: {...row.order, ...sale}};
+            if (sale.state !== "sale" && picking.state !== "done") picking.state = "cancel";
+        }
         let bridge=null;
         if(isSale(row)) {
             const record=await bridgeForSource(picking.id);
@@ -4182,29 +4445,32 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         const productIds = [...new Set([...orderProductIds, ...extraProductIds, ...baselineProductIds].filter(Boolean))];
         const locationId = m2oId(picking.location_id);
         const cached = options.catalog;
-        const useCatalog = cached && Number(cached.picking.id) === Number(picking.id) &&
+        const requestedIds = new Set(productIds.map(Number));
+        const recent = cached && Number(cached.picking.id) === Number(picking.id) &&
             m2oId(cached.picking.location_id) === locationId && Date.now() - cached.codesLoadedAt < 15000 &&
-            cached.boxCodesLoadedAt === state.boxLoadedAt && productIds.every(id => cached.products.some(p => Number(p.id) === Number(id)));
+            cached.boxCodesLoadedAt === state.boxLoadedAt;
+        const loadedIds = cached?.catalogProductIds;
+        const useCatalog = recent && loadedIds?.length === requestedIds.size &&
+            loadedIds.every(id => requestedIds.has(id));
         let products, stock, systemCodes;
         if (useCatalog) {
-            products = cached.products.filter(p => productIds.includes(Number(p.id)));
+            products = cached.products.filter(p => requestedIds.has(Number(p.id)));
             stock = cached.stock;
             systemCodes = cached.systemCodes;
         } else {
-            const productCodeFields = await discoverProductCodeFields();
-            const [freshProducts, quants] = await Promise.all([
-                readProductsByIds(productIds, productCodeFields),
-                productIds.length && locationId ? searchRead("stock.quant", [
+            const [catalog, quants] = await Promise.all([
+                readScanCatalog(productIds),
+                productIds.length && locationId ? readAll("stock.quant", [
                     ["product_id", "in", productIds], ["location_id", "child_of", locationId],
-                ], ["product_id", "quantity", "reserved_quantity"], { limit: 10000 }) : [],
+                ], ["id", "product_id", "quantity", "reserved_quantity"], 1000) : [],
             ]);
-            products = freshProducts;
+            products = catalog.products;
+            systemCodes = catalog.systemCodes;
             stock = new Map();
             for (const quant of quants) {
                 const id = m2oId(quant.product_id);
                 stock.set(id, (stock.get(id) || 0) + Number(quant.quantity || 0));
             }
-            systemCodes = await collectSystemCodes(products, productCodeFields);
         }
         const odooCodeCount = new Set(systemCodes.flatMap((item) => Core.parseCodeList(item.code))).size;
         const boxCodeCount = new Set(state.boxMappings.filter((item) => item.enabled).map((item) => Core.normalizeCode(item.boxCode)).filter(Boolean)).size;
@@ -4212,6 +4478,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             bridge, completedPrepickArchive, completedArchiveError,
             salesCancelAck: sharedEvents.some(e=>Core.normalizeSharedEvent(e).op.scope==="sales_cancel_ack"),
             row, picking, moves, products, stock, tech, storedTech, sharedEvents, sharedEventCount: sharedEvents.length, systemCodes, orderProductIds,
+            catalogProductIds: products.map(product => Number(product.id)),
             responsible: effectivePicker(picking, tech),
             index: Core.productCodeIndex(products, state.boxMappings, systemCodes),
             codesLoadedAt: useCatalog ? cached.codesLoadedAt : Date.now(), odooCodeCount, boxCodeCount, boxCodesLoadedAt: state.boxLoadedAt,
@@ -4299,7 +4566,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
                 const requestChanged = prepickStateFingerprint(record) !== prepickStateFingerprint(state.detail.request);
                 if (m2oId(record.x_pb_picking_id) && !record.x_pb_change_pending) {
                     invalidateDashboardIndex();
-                    state.view = "dashboard"; state.detail = null; state.session = null; state.pickerDraft = null; state.quantityDrafts.clear();
+                    state.view = "dashboard"; state.detail = null; state.session = null; state.pickerDraft = null; state.quantityDraftBases.clear(); state.quantityDrafts.clear();
                     if (options.renderView !== false) render();
                     setTimeout(() => refresh(true), 0);
                     toast(t("paidLinked"), "ok", 2600);
@@ -4552,6 +4819,32 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
 
         }
 
+        async verifyCompletedMoves(pickingId, expectedMoves) {
+            const moves = await readAll("stock.move", [["picking_id","=",pickingId],["state","!=","cancel"]],
+                ["id","product_id","product_uom","state","quantity"]);
+            const lines = await readAll("stock.move.line", [["picking_id","=",pickingId],["state","=","done"]],
+                ["id","move_id","product_id","product_uom_id","quantity"]);
+            const unitIds = [...new Set([...moves.map(m => m2oId(m.product_uom)), ...lines.map(l => m2oId(l.product_uom_id))])];
+            const units = await searchRead("uom.uom", [["id","in",unitIds]], ["id","factor"], {limit:unitIds.length});
+            const factors = new Map(units.map(u => [u.id, Number(u.factor)]));
+            const byId = new Map(moves.map(m => [m.id,m])), totals = new Map();
+            const close = (a,b) => Number.isFinite(a) && Number.isFinite(b) && Math.abs(a-b) < 1e-7;
+            const mismatch = () => Object.assign(new Error(pbUiText("交货状态与商品明细尚未核对一致，请打开原生交货单核对。","Revise la entrega en Odoo. El estado y las líneas aún no concuerdan.")),{code:"NATIVE_READBACK_MISMATCH"});
+            for (const line of lines) {
+                const move = byId.get(m2oId(line.move_id));
+                if (!move || m2oId(line.product_id)!==m2oId(move.product_id)) throw mismatch();
+                const quantity = Number(line.quantity)*factors.get(m2oId(line.product_uom_id))/factors.get(m2oId(move.product_uom));
+                totals.set(move.id, (totals.get(move.id) ?? 0)+quantity);
+            }
+            if (moves.length!==expectedMoves.length) throw mismatch();
+            for (const expected of expectedMoves) {
+                const move = byId.get(expected.id), demand = Core.demandOf(expected);
+                if (!move || move.state!=="done" || m2oId(move.product_id)!==m2oId(expected.product_id) ||
+                    m2oId(move.product_uom)!==m2oId(expected.product_uom) ||
+                    !close(Number(move.quantity),demand) || !close(totals.get(move.id) ?? 0,demand)) throw mismatch();
+            }
+        }
+
         assertNativeActionAccepted(validationResult) {
 
             if (validationResult && typeof validationResult === "object") {
@@ -4626,8 +4919,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             if (!Core.canFinalize(detail.tech, detail.moves) || !Core.assertBaseline(detail.tech, detail.moves).ok) throw Object.assign(new Error(t("cannotValidate")), { code: "NOT_READY" });
             saveUndoRecord(context.pickingId, null);
             render();
-            const original = nativeMoves.map((move) => ({ id: move.id, quantity: Number(move.quantity || 0), picked: Boolean(move.picked) }));
-            const completed = [];
+            const attempted = [];
             try {
                 for (const move of nativeMoves) {
                     if(detail.bridge?.paid){
@@ -4638,26 +4930,27 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
                     if (!Core.verifyLock(Core.safeParse(lockCheck[state.fieldMap.tech]), context.session)) {
                         throw Object.assign(new Error("配货期间发生设备接管"), { code: "LOCK_LOST" });
                     }
+                    attempted.push(move.id);
                     await stockWriter.writeMoveQuantity(move.id, Core.demandOf(move), true);
-                    completed.push(move.id);
                 }
                 const finalLockCheck = await readOne("stock.picking", detail.picking.id, [state.fieldMap.tech]);
                 if (!Core.verifyLock(Core.safeParse(finalLockCheck[state.fieldMap.tech]), context.session)) {
                     throw Object.assign(new Error("配货期间发生设备接管"), { code: "LOCK_LOST" });
                 }
             } catch (error) {
-                let rollbackFailed = false;
-                for (const previous of original.filter((item) => completed.includes(item.id)).reverse()) {
-                    if(detail.bridge?.paid){
-                        try {const target=await readOne('stock.picking',nativePickingId,['state']);if(!target||['done','cancel'].includes(target.state)){rollbackFailed=true;break;}}
-                        catch(_error){rollbackFailed=true;break;}
-                    }
-                    try { await stockWriter.writeMoveQuantity(previous.id, previous.quantity, previous.picked); } catch (_rollbackError) { rollbackFailed = true; }
-                }
-                const wrapped = new Error(`填写原生数量失败，${rollbackFailed ? "部分回滚失败，请立即检查原生交货单" : "已完成回滚"}：${error.message}`);
-                wrapped.code = rollbackFailed ? "NATIVE_ROLLBACK_FAILED" : (error.code || "NATIVE_FILL_FAILED");
-                throw wrapped;
+                if (!attempted.length) throw error;
+                retainGuard = true;
+                let observation;
+                try {
+                    const rows = await searchRead("stock.move", [["id","in",attempted],["picking_id","=",nativePickingId]],
+                        ["id","quantity","picked","state"], {limit:attempted.length});
+                    observation = rows.map(m => m.id+"="+m.quantity+" ("+m.state+", picked="+m.picked+")").join(", ");
+                } catch (readError) { observation = readError.message; }
+                throw Object.assign(new Error(pbUiText("已停止填写。请核对交货单","Escritura detenida. Revise la entrega")+
+                    " #"+nativePickingId+" ["+attempted.join(", ")+"] · "+(observation||"?")+" · "+error.message),
+                    {code:"NATIVE_FILL_UNCERTAIN",cause:error});
             }
+            retainGuard = true;
             detail = await loadDetail(context.row);
             assertWritableDetail(detail);
             assertBridgeTargetSnapshot(detail,nativePickingId,nativeMoves);
@@ -4681,6 +4974,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             this.assertNativeActionAccepted(validationResult);
             const finalPicking = await readOne("stock.picking", nativePickingId, ["id", "state", "date_done"]);
             this.assertNativeCompleted(finalPicking);
+            await this.verifyCompletedMoves(nativePickingId, nativeMoves);
             // Only publish the custom completion label after Odoo has confirmed
             // the stock transfer. Failure here must never invite another delivery.
             let completionStatusError = null;
@@ -4720,13 +5014,16 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             } catch (error) {
                 // A lost response is NOT proof that the transfer failed. Never retry
                 // button_validate or clear its guard based on a network error.
-                retainGuard = isNetworkError(error) || error.code === "NATIVE_ROLLBACK_FAILED";
-                if (nativeCommitStarted && retainGuard) {
+                retainGuard = retainGuard || isNetworkError(error);
+                if (nativeCommitStarted && isNetworkError(error)) {
                     try {
-                        const fresh = await loadDetail(context.row);
+                        const native = await readOne("stock.picking",nativePickingId,["id","state"]);
+                        this.assertNativeCompleted(native);
+                        await this.verifyCompletedMoves(nativePickingId,nativeMoves);
+                        const fresh = await readTaskDetail(context.row);
                         if (isReadOnlyDetail(fresh)) {
                             if (Number(state.detail?.picking.id) === context.pickingId) { enterReadOnlyDetail(fresh); render(); }
-                            return { validated: fresh.picking.state === "done", recovered: true };
+                            return { validated: true, recovered: true };
                         }
                     } catch (_checkError) { /* the durable guard remains */ }
                     throw Object.assign(new Error(t("validationUncertain")), { code: "VALIDATION_UNCERTAIN" });
@@ -4881,7 +5178,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
     async function checkValidationResult() {
         const old = state.detail;
         if (!old || state.validationAction) return;
-        const fresh = await loadDetail(old.row);
+        const fresh = await readTaskDetail(old.row);
         if (Number(state.detail?.picking.id) !== Number(old.picking.id)) return;
         if (isReadOnlyDetail(fresh)) { enterReadOnlyDetail(fresh); render(); return; }
         state.detail = fresh; render();
@@ -5173,7 +5470,12 @@ function inspectOfflineQueue(storage, baseKey) {
                     // Keep this page's offline operations ordered. Another tab may
                     // have its own active saves in the same durable outbox; its
                     // immutable IDs and device lock already protect server replay.
-                    if (!navigator.onLine || flow.offlineBlockedOrders.has(Number(op.pickingId))) throw new Error('offline: preceding operation is pending');
+                    const pickingId = Number(op.pickingId);
+                    if (flow.offlineBlockedOrders.has(pickingId)) {
+                        const pending = offlineQueue().filter(item => Number(item.pickingId)===pickingId);
+                        if (pending[0]?.id===op.id && !flow.offlineFlushing) flow.offlineBlockedOrders.delete(pickingId);
+                    }
+                    if (!navigator.onLine || flow.offlineBlockedOrders.has(pickingId)) throw new Error('offline: preceding operation is pending');
                     const result = await applyOnline(op);
                     removeOfflineOperation(op.id);
                     if (!result.contextActive) return { ok: true, result };
@@ -5204,7 +5506,7 @@ function inspectOfflineQueue(storage, baseKey) {
                         const pending = offlineQueue();
                         if (Number(task.detail?.picking?.id) === Number(op.pickingId)) optimisticOperation(op); flow.saveError = "";
                         toast(state.lang === "es" ? `Servidor pendiente de confirmar: ${pending.length} registros guardados en este dispositivo` : `服务器尚未确认：本机保留 ${pending.length} 条记录，恢复后核对同步`, "warn", 6000);
-                        return { ok: true, offline: true };
+                        return { ok: true, offline: true, pendingId: op.id };
                     } else {
                         if (quantity) flow.quantitySaveEpoch += 1;
                         removeOfflineOperation(op.id);
@@ -5229,7 +5531,7 @@ function inspectOfflineQueue(storage, baseKey) {
         flush(options = {}) {
             const state = this.runtime, flow = this.flow, task = this.task;
             const {
-                
+
             } = this.dependencies;
             // Never race the live save queue or replay a pending event twice.
             const flushing = flow.mutationQueue.then(() => this.flushUnlocked(options));
@@ -5292,7 +5594,27 @@ function inspectOfflineQueue(storage, baseKey) {
                         removeOfflineOperation(op.id);
                         pending = offlineQueue();
                         synced += 1;
+                        const feedback = state.scanFeedback;
+                        if (feedback?.pendingId === op.id && scanContextActive(feedback)) {
+                            setScanFeedback(pbUiText("服务器已保存","Guardado en servidor"), "ok", feedback);
+                        }
                     } catch (error) {
+                        if (error.code==="EVENT_REJECTED" && error.eventError?.id===op.id &&
+                            error.eventError.code==="EDIT_COUNT_CHANGED" && op.type==="set" &&
+                            Number(task.detail?.picking?.id)===targetPickingId) {
+                            const row=sharedOperationRecord(task.detail,op.id);
+                            if (row) {
+                                verifyExistingOperation(row,op);
+                                const key="pbful_rejected_event_v1_op:"+op.id;
+                                const archive=JSON.stringify({op,serverId:row.id,reason:"EDIT_COUNT_CHANGED",at:new Date().toISOString()});
+                                localStorage.setItem(key,archive);
+                                if (localStorage.getItem(key)!==archive) throw new Error("Rejection archive could not be verified");
+                                removeOfflineOperation(op.id);
+                                pending=offlineQueue();
+                                toast(pbUiText("旧的手工改量已核对并归档，继续同步后续扫码。","Edición anterior rechazada y archivada. Continúa la sincronización."),"warn",5000);
+                                continue;
+                            }
+                        }
                         if (!isNetworkError(error)) flow.saveError = error.message || String(error);
                         handleMutationError(error);
                         break;
@@ -5304,6 +5626,15 @@ function inspectOfflineQueue(storage, baseKey) {
             }
             const currentRemaining = offlineQueue().filter((item) => Number(item.pickingId) === targetPickingId).length;
             if (!currentRemaining) flow.offlineBlockedOrders?.delete(targetPickingId);
+            else if (synced>0 && relevant.every(item => !offlineQueue().some(p => p.id===item.id))) {
+                // New scans may arrive while the prior snapshot is being acknowledged.
+                // Drain just this order after its queued local saves have settled.
+                flow.mutationQueue.then(() => {
+                    if (navigator.onLine && Number(task.detail?.picking?.id)===targetPickingId && task.session &&
+                        !flow.offlineFlushing && offlineQueue().some(item => Number(item.pickingId)===targetPickingId))
+                        return this.flush({manual:false});
+                }).catch(handleMutationError);
+            }
             if (synced && currentRemaining) toast(`已同步 ${synced} 条，本单仍有 ${currentRemaining} 条待上传`, "warn", 4000);
             return { synced, remaining: pending.length, currentRemaining };
 
@@ -5395,6 +5726,7 @@ function inspectOfflineQueue(storage, baseKey) {
         // The event log is authoritative even after the 200-entry appliedOps cache expires.
         const existingEvent = sharedOperationRecord(detail, op.id);
         if (existingEvent) {
+            verifyExistingOperation(existingEvent,op);
             const rejected = detail.tech.eventSync?.rejectedEvents?.find(item => item.id === op.id);
             if (rejected) throw Object.assign(new Error(`并发操作未应用：${rejected.code}`), {code:'EVENT_REJECTED', eventError:rejected});
             if (!['done','applied','ok'].includes(Core.normalizeSharedEvent(existingEvent).status)) throw Object.assign(new Error('扫码事件尚未确认'), {code:'VERIFY_FAILED'});
@@ -5547,6 +5879,54 @@ function inspectOfflineQueue(storage, baseKey) {
         return {request,picking,pickingId,records};
     }
 
+    async function recoverCancelledOffline() {
+        if (!navigator.onLine || state.bulkAction || state.validationAction || state.offlineFlushing) return;
+        const es = state.lang === 'es';
+        const ids = [...new Set(offlineQueue().map(op => Number(op.pickingId)).filter(id => id > 0))];
+        if (!ids.length) return;
+        const context = {kind:'cancelled-offline-review', id:Core.makeId('review')};
+        state.bulkAction = context;
+        try {
+            await state.mutationQueue;
+            const cancelled = await readAll('stock.picking',[['id','in',ids],['state','=','cancel']],['name','state']);
+            if (!cancelled.length) return await showPrompt(es?'No hay entregas canceladas entre estos pendientes.':'待同步记录中没有已取消的交货单。');
+            let id = null;
+            await showPrompt(es?'Elija la entrega cancelada.':'选择要核对的已取消交货单。','info',{
+                actions:[{label:es?'Volver':'返回',value:false},...cancelled.map(p=>({label:p.name+' (#'+p.id+')',waitForAction:true,onClick:()=>{ id=p.id; }}))]
+            });
+            if (!cancelled.some(p=>p.id===id)) return;
+            await withDeviceMutationLock(id, async () => {
+                async function inspect() {
+                    const picking = await readOne('stock.picking',id,['name','state','write_date']);
+                    if (picking?.state !== 'cancel') throw new Error(es?'La entrega cambió.':'交货状态已变化，请重新核对。');
+                    const ops = offlineQueue().filter(op => Number(op.pickingId)===id).sort((a,b)=>a.id.localeCompare(b.id));
+                    const server = await loadSharedEvents(id);
+                    const records = ops.map(op => ({op,events:server.filter(e=>e.x_name===op.id)}));
+                    return {picking, records};
+                }
+                const first = await inspect();
+                if (!first.records.length) return;
+                const lines = first.records.map(({op,events})=>[op.id,op.code||op.moveId||'',op.type,op.value??op.amount??'',events.length?(es?'Con registro':'服务器有记录'):(es?'Sin registro':'服务器未查到')].join(' · '));
+                const ok = await showPrompt([first.picking.name,...lines,es?'Archivar en este dispositivo. Revise la mercancía antes de escanear en la nueva entrega.':'归档这张已取消交货单的记录。请对照实物，在新单按实际数量扫码。'].join('\n'),'confirm');
+                if (!ok) return;
+                const readback = await inspect();
+                if (JSON.stringify(first)!==JSON.stringify(readback)) throw new Error(es?'Los pendientes cambiaron. Revise de nuevo.':'核对期间记录有变化，请重新核对。');
+                for (const {op,events} of readback.records) {
+                    const key = 'pbful_withdrawn_offline_v1_op:'+op.id;
+                    const archive = {op,at:new Date().toISOString(),description:op.code||String(op.moveId||op.id),reason:'cancelled_native_delivery',
+                        order:readback.picking.name,serverEvents:events,linkedPickingId:id};
+                    saveJson(key,archive);
+                    if (JSON.stringify(loadJson(key,null))!==JSON.stringify(archive)) throw new Error('ARCHIVE_READBACK_FAILED');
+                }
+                for (const {op} of readback.records) removeOfflineOperation(op.id);
+                if (!offlineQueue().some(op=>Number(op.pickingId)===id)) state.offlineBlockedOrders.delete(id);
+                toast(es?'Registro archivado.':'旧单记录已归档。','ok');
+            });
+        } finally {
+            if (state.bulkAction===context) state.bulkAction=null;
+            render();
+        }
+    }
     async function recoverOrphanOffline() {
         if (!navigator.onLine || state.bulkAction || state.validationAction || state.offlineFlushing) return;
         const es = state.lang === "es";
@@ -5655,7 +6035,7 @@ function inspectOfflineQueue(storage, baseKey) {
                 if (!offlineQueue().some(op=>Number(op.pickingId)===context.pickingId)) state.offlineBlockedOrders.delete(context.pickingId);
                 // Keep the verified server snapshot if the final refresh loses the network.
                 state.detail=verified.displayDetail || verified;
-                state.quantityDrafts.clear();state.lastAction=null;state.saveError='';
+                state.quantityDraftBases.clear(); state.quantityDrafts.clear();state.lastAction=null;state.saveError='';
                 state.detail=await loadDetail(context.row);
                 toast(es?'Pendientes retirados. Revise y escanee de nuevo.':'待上传记录已撤回，请核对实物后重新扫码。','ok');
             });
@@ -5715,7 +6095,8 @@ function inspectOfflineQueue(storage, baseKey) {
             SHARED_INIT_FAILED: error.message,
             SHARED_STATE_LOST: error.message,
             SHARED_SESSION_REQUIRED: "请填写配货员并加入多设备配货",
-            EVENT_REJECTED: error.message,
+            EDIT_COUNT_CHANGED: state.lang==="es" ? "La cantidad cambió durante la edición. Revise la línea y vuelva a escribirla." : "输入期间该行数量已变化，请核对后重新输入。",
+            EVENT_REJECTED: error.eventError?.code==="EDIT_COUNT_CHANGED" ? pbUiText("数量已变化，本次改量未应用。","La cantidad cambió. No se aplicó la edición.") : error.message,
         };
         toast(map[error.code] || error.message || "操作失败", "error", 6000);
         if (["LOCK_LOST", "DEMAND_CHANGED", "TERMINAL", "VERIFY_FAILED", "NATIVE_ROLLBACK_FAILED", "SHARED_STATE_LOST"].includes(error.code)) {
@@ -5845,11 +6226,17 @@ function inspectOfflineQueue(storage, baseKey) {
                                 if (saved?.ok === false) {
                                     const error = saved.error || new Error('SCAN_FAILED');
                                     debugScan('ERROR', item, {reason:error.code});
+                                    const changed = ['ORDER_CHANGED','DEMAND_CHANGED','EDIT_COUNT_CHANGED','TERMINAL','TASK_WITHDRAWN'].includes(error.code);
+                                    const rejected = ['UNKNOWN_BARCODE','WRONG_PRODUCT','OVER_SCAN','AMBIGUOUS_BARCODE'].includes(error.code);
+                                    const message = rejected ? scanErrorPresentation(error.code).note : state.lang==='es'
+                                        ? (changed?'Pedido modificado. Revise este escaneo.':'Sin confirmación. Revise este escaneo.')
+                                        : (changed?'订单已变更，请核对本次扫码。':'本次扫码未获确认，请核对。');
+                                    setScanFeedback(item.code+' · '+message,'warn',item.context);
                                     pauseScanForError(error, {code:item.code, context:item.context, product:error.product,
                                         noCount:['UNKNOWN_BARCODE','WRONG_PRODUCT','OVER_SCAN','AMBIGUOUS_BARCODE','LOOKUP_OFFLINE','LOCAL_SAVE_FAILED'].includes(error.code)});
                                 } else {
                                     debugScan('DONE', item, {outcome:saved?.offline?'offline_saved':'saved'});
-                                    setScanFeedback(state.lang==='es'?item.code+' · '+(saved?.offline?'Guardado localmente, pendiente':'Guardado en servidor'):item.code+' · '+(saved?.offline?'已保存本机，待同步':'服务器已保存'),'ok',item.context);
+                                    setScanFeedback(state.lang==='es'?item.code+' · '+(saved?.offline?'Guardado localmente, pendiente':'Guardado en servidor'):item.code+' · '+(saved?.offline?'已保存本机，待同步':'服务器已保存'),'ok',item.context,saved?.pendingId);
                                 }
                             };
                             if (result?.saving && result.ok !== false) {
@@ -5867,7 +6254,7 @@ function inspectOfflineQueue(storage, baseKey) {
                                 if(flow.scanAlert)break;
                             }else{
                                 debugScan('DONE',item,{outcome:saved?.offline?'offline_saved':'saved'});
-                                setScanFeedback(state.lang==='es'?item.code+' · '+(saved?.offline?'Guardado localmente':'Guardado'):item.code+' · '+(saved?.offline?'已保存本机，待同步':'已保存'),'ok',item.context);
+                                setScanFeedback(state.lang==='es'?item.code+' · '+(saved?.offline?'Guardado localmente':'Guardado'):item.code+' · '+(saved?.offline?'已保存本机，待同步':'已保存'),'ok',item.context,saved?.pendingId);
                             }
                         }catch(error){
                             debugScan('ERROR',item,{reason:error.code||error.message});
@@ -5949,9 +6336,9 @@ function inspectOfflineQueue(storage, baseKey) {
         return Boolean(state.detail && state.session && Number(context.pickingId) === Number(state.detail.picking.id) && context.token === state.session.token);
     }
 
-    function setScanFeedback(message, kind, context) {
+    function setScanFeedback(message, kind, context, pendingId = null) {
         if (!scanContextActive(context) || context.scanId !== state.scanFeedback?.scanId) return;
-        state.scanFeedback = { ...context, message, kind };
+        state.scanFeedback = { ...context, message, kind, pendingId };
         const el = root?.getElementById('pbful-scan-feedback');
         if (el) { el.hidden = false; el.textContent = message; el.title = message; el.dataset.kind = kind; }
     }
@@ -6033,20 +6420,39 @@ function inspectOfflineQueue(storage, baseKey) {
         if (state.scanLookup === lookup) state.scanLookup=null;
     }
 
+    // Limit only read-only identification. A late read cannot run the count path.
+    async function scanLookupBefore(read, deadline) {
+        const timeout = () => Object.assign(new Error('SCAN_LOOKUP_TIMEOUT'), {code:'LOOKUP_OFFLINE'});
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) throw timeout();
+        let timer;
+        try {
+            return await Promise.race([read(), new Promise((_, reject) => {
+                timer = setTimeout(() => reject(timeout()), remaining);
+            })]);
+        } finally { clearTimeout(timer); }
+    }
+
     async function resolveScannedCodeNow(code, context) {
         if (!state.detail || !state.session || Number(context.pickingId) !== Number(state.detail.picking.id) || context.token !== state.session.token) return rejectScannedCode("配货页面或负责人已经切换，本次扫码未处理", "STALE_CONTEXT");
+        const lookupDeadline = performance.now() + 6000;
         const pendingLookup = !state.detail.index.get(code) ? beginPendingScanLookup(code, context) : null;
         try {
         assertWritableDetail();
         assertNotValidating();
+        if (state.detail.boxCodesLoadedAt !== state.boxLoadedAt && state.boxLoadedAt > 0) {
+            state.detail.index = Core.productCodeIndex(state.detail.products, state.boxMappings, state.detail.systemCodes);
+            state.detail.boxCodeCount = enabledBoxCodeCount();
+            state.detail.boxCodesLoadedAt = state.boxLoadedAt;
+        }
         let hit = state.detail.index.get(code);
         let resolvedProduct = null;
         if (hit?.ambiguous) return rejectScannedCode(hit.reason === "box_quantity_conflict" ? `小盒表格中 ${code} 的“每扫增加数量”不一致，请先修正表格` : `条码对应多个商品：${code}，请先修正 Odoo 或小盒表格`, "AMBIGUOUS_BARCODE", "error", 5000);
         if (!hit) {
             const now = Date.now();
-            if (now - state.boxLoadedAt > BOX_MISS_REFRESH_MS && now - state.lastBoxMissRefreshAt > BOX_MISS_REFRESH_MS) {
+            if (state.boxLoadPromise || (now - state.boxLoadedAt > BOX_MISS_REFRESH_MS && now - state.lastBoxMissRefreshAt > BOX_MISS_REFRESH_MS)) {
                 state.lastBoxMissRefreshAt = now;
-                await refreshBoxMappings();
+                await scanLookupBefore(refreshBoxMappings, lookupDeadline);
                 if (!state.detail || !state.session || Number(context.pickingId) !== Number(state.detail.picking.id) || context.token !== state.session.token) return rejectScannedCode("更新小盒码期间配货页面已经切换，本次扫码未处理", "STALE_CONTEXT");
                 state.detail.index = Core.productCodeIndex(state.detail.products, state.boxMappings, state.detail.systemCodes);
                 state.detail.boxCodeCount = enabledBoxCodeCount();
@@ -6057,7 +6463,7 @@ function inspectOfflineQueue(storage, baseKey) {
         }
         if (!hit) {
             let found;
-            try { found = await lookupProductByCode(code); }
+            try { found = await scanLookupBefore(() => lookupProductByCode(code), lookupDeadline); }
             catch (error) {
                 if (isNetworkError(error)) return rejectScannedCode(`${t("lookupFailed")}：网络不可用，本次未计数`, "LOOKUP_OFFLINE", "warn", 5000);
                 throw error;
@@ -6068,14 +6474,19 @@ function inspectOfflineQueue(storage, baseKey) {
                 return rejectScannedCode(state.lang==='es'?'Código no reconocido.':'无法识别条码。', 'UNKNOWN_BARCODE', 'error');
             }
             resolvedProduct = found.product;
-            hit = { productId: found.product.id, source: found.source, quantity: found.quantity || 1 };
+            hit = { productId: found.product.id, source: found.source, quantity: found.quantity ?? 1 };
             // Reuse this verified lookup within the current catalog; normal code refresh rebuilds the index.
             state.detail.index.set(code, hit);
             if (!state.detail.products.some(product => Number(product.id) === Number(found.product.id))) state.detail.products.push(found.product);
         }
         if (state.scanAlert && state.scanAlert !== pendingLookup) return {ok:false,error:Object.assign(new Error('SCAN_PAUSED'),{code:'SCAN_PAUSED'})};
         endPendingScanLookup(pendingLookup);
-        const amount = hit.source === "sheet_fallback" ? Number(hit.quantity || 1) : 1;
+        const amount = Number(hit.quantity ?? 1);
+        if (!Number.isSafeInteger(amount) || amount<1 || amount>9999)
+            return rejectScannedCode(pbUiText("单位无法换算为整件，本次未计数，请在原生交货单核对。","Unidad sin equivalencia en piezas enteras. Sin contar. Revise la entrega."),"UNSUPPORTED_SCAN_UNIT","warn");
+        const product = state.detail.products.find(p => Number(p.id)===Number(hit.productId));
+        if (product?.uom_id && state.detail.moves.some(m => m2oId(m.product_id)===Number(hit.productId) && m.product_uom && m2oId(m.product_uom)!==m2oId(product.uom_id)))
+            return rejectScannedCode(pbUiText("本商品的交货单位与商品单位不同，请在原生交货单核对。本次未计数。","La unidad de entrega difiere de la del producto. Sin contar. Revise en Odoo."),"MOVE_UNIT_MISMATCH","warn");
         const allowOverScan = false;
         const ordered = state.detail.orderProductIds.some((id) => Number(id) === Number(hit.productId));
         if (!ordered) {
@@ -6087,6 +6498,9 @@ function inspectOfflineQueue(storage, baseKey) {
         if (!move) return rejectScannedCode(`订单中找不到商品行：${code}`, "WRONG_PRODUCT", "error", 3500);
         setScanFeedback(state.lang === 'es' ? `${code} · +${amount} · Guardando` : `${code} · +${amount} · 正在保存`, 'info', context);
         return submitScanOperation({ id: Core.makeId("op"), type: "inc", moveId: move.id, amount, allowOverScan, guardStrict:true, scannerInput:true, code, source: hit.source, pickingId: context.pickingId });
+        } catch (error) {
+            if (error.code === 'LOOKUP_OFFLINE') return rejectScannedCode(error.message, 'LOOKUP_OFFLINE', 'warn');
+            throw error;
         } finally { endPendingScanLookup(pendingLookup); }
     }
 
@@ -6094,6 +6508,16 @@ function inspectOfflineQueue(storage, baseKey) {
         const text = String(rawValue ?? "").trim();
         if (!/^\d+$/.test(text) || !Number.isSafeInteger(Number(text))) return null;
         return Number(text);
+    }
+
+    function rememberQuantityDraft(key,value) {
+        if (!state.quantityDrafts.has(key) && state.detail) {
+            const [kind,id]=key.split(":");
+            const tech=displayTech(state.detail);
+            const counts=kind==="move"?tech.counts:tech.extraCounts;
+            state.quantityDraftBases.set(key, Number(counts?.[id] || 0));
+        }
+        state.quantityDrafts.set(key,value);
     }
 
     function commitQuantityInput(input) {
@@ -6122,9 +6546,10 @@ function inspectOfflineQueue(storage, baseKey) {
         const current = Number(state.detail.tech.counts?.[String(move.id)] || 0);
         if (value === null) return quantityEntryError();
         if (value === current && !state.queuedMutations) { state.quantityDrafts.delete(`move:${moveId}`); render(); return true; }
+        const expectedCount = state.quantityDrafts.has(`move:${moveId}`) ? state.quantityDraftBases.get(`move:${moveId}`) ?? current : current;
         const pickingId = state.detail.picking.id;
         state.quantityDrafts.delete(`move:${moveId}`);
-        queueOperation({ id: Core.makeId("op"), type: "set", moveId: move.id, value, allowOverScan: true, source: "manual_set", code: "MANUAL_SET" }).then((result) => {
+        queueOperation({ id: Core.makeId("op"), type: "set", moveId: move.id, value, expectedCount, allowOverScan: true, source: "manual_set", code: "MANUAL_SET" }).then((result) => {
             if (result?.ok === false && !result.guardRejected && state.detail?.picking.id === pickingId && !state.quantityDrafts.has(`move:${moveId}`) && ![...state.pendingQuantityOps.values()].some(({op}) => Number(op.pickingId) === Number(pickingId) && Number(op.moveId) === Number(moveId))) { state.quantityDrafts.set(`move:${moveId}`, String(rawValue)); render(); }
         });
         return true;
@@ -6139,9 +6564,10 @@ function inspectOfflineQueue(storage, baseKey) {
         if (value === null) return quantityEntryError();
         const current = Number(state.detail.tech.extraCounts?.[String(productId)] || 0);
         if (value === current && !state.queuedMutations) { state.quantityDrafts.delete(`extra:${productId}`); render(); return true; }
+        const expectedCount = state.quantityDrafts.has(`extra:${productId}`) ? state.quantityDraftBases.get(`extra:${productId}`) ?? current : current;
         const pickingId = state.detail.picking.id;
         state.quantityDrafts.delete(`extra:${productId}`);
-        queueOperation({ id: Core.makeId("op"), scope: "extra", type: "set", productId, value, code: "MANUAL_EXTRA_SET" }).then((result) => {
+        queueOperation({ id: Core.makeId("op"), scope: "extra", type: "set", productId, value, expectedCount, code: "MANUAL_EXTRA_SET" }).then((result) => {
             if (result?.ok === false && !result.guardRejected && state.detail?.picking.id === pickingId && !state.quantityDrafts.has(`extra:${productId}`) && ![...state.pendingQuantityOps.values()].some(({op}) => Number(op.pickingId) === Number(pickingId) && op.scope === "extra" && Number(op.productId) === Number(productId))) { state.quantityDrafts.set(`extra:${productId}`, String(rawValue)); render(); }
         });
         return true;
@@ -6235,7 +6661,7 @@ function inspectOfflineQueue(storage, baseKey) {
         if (linkedPickingId) {
             await migrateRequestToPicking(updatedRequest, linkedPickingId, m2oId(updatedRequest.x_pb_pos_order_id));
             if (!contextActive()) return;
-            state.quantityDrafts.clear();
+            state.quantityDraftBases.clear(); state.quantityDrafts.clear();
             state.view = "dashboard"; state.detail = null; state.session = null; state.pickerDraft = null;
             render();
             await refresh(true);
@@ -6245,7 +6671,7 @@ function inspectOfflineQueue(storage, baseKey) {
         if (!contextActive()) return;
         const refreshed = await loadPrepickDetail(prepickRow(updatedRequest));
         if (!contextActive()) return;
-        state.quantityDrafts.clear();
+        state.quantityDraftBases.clear(); state.quantityDrafts.clear();
         state.detail = refreshed;
         const baseline = Core.assertBaseline(refreshed.tech, refreshed.moves);
         if (refreshed.request.x_pb_change_pending || !baseline.ok) throw Object.assign(new Error(t("changedHelp")), {code:"ORDER_CHANGED"});
@@ -6263,7 +6689,7 @@ function inspectOfflineQueue(storage, baseKey) {
         const requestId = state.detail.request.id;
         await rpc(PREPICK_MODEL, "write", [[requestId], { x_pb_cancel_ack: true }]);
         if (state.detail?.request?.id !== requestId) return;
-        state.detail.request.x_pb_cancel_ack = true; state.saveError = ""; state.quantityDrafts.clear();
+        state.detail.request.x_pb_cancel_ack = true; state.saveError = ""; state.quantityDraftBases.clear(); state.quantityDrafts.clear();
         render();
     }
 
@@ -6278,6 +6704,39 @@ function inspectOfflineQueue(storage, baseKey) {
         state.promptQueue.push({ message: text, kind, options, resolve, promise });
         openNextPrompt();
         return promise;
+    }
+
+    // A fixed modal is centered in the layout viewport by default. On Android the
+    // IME can shrink and pan the visual viewport while the layout viewport stays tall.
+    function fitOrderNoteViewport(dialog, actions, input) {
+        const viewport = window.visualViewport;
+        if (!viewport) return;
+        let frame = 0;
+        const update = () => {
+            frame = 0;
+            if (!dialog.open || viewport.height <= 0 || viewport.width <= 0) return;
+            dialog.style.setProperty("--note-center-x", (viewport.offsetLeft + viewport.width / 2) + "px");
+            dialog.style.setProperty("--note-center-y", (viewport.offsetTop + viewport.height / 2) + "px");
+            dialog.style.setProperty("--note-width", viewport.width + "px");
+            dialog.style.setProperty("--note-height", viewport.height + "px");
+            dialog.classList.toggle("pbful-short-note", viewport.height < 340);
+        };
+        const schedule = () => { if (!frame) frame = requestAnimationFrame(update); };
+        dialog.classList.add("pbful-viewport-note");
+        update();
+        viewport.addEventListener("resize", schedule);
+        viewport.addEventListener("scroll", schedule);
+        // Keep the keyboard and the buttons still until the deliberate tap completes.
+        actions.addEventListener("pointerdown", event => {
+            if (event.isPrimary && event.button === 0 && input.matches(":focus") && event.target.closest("button")) {
+                event.preventDefault();
+            }
+        });
+        dialog.addEventListener("close", () => {
+            viewport.removeEventListener("resize", schedule);
+            viewport.removeEventListener("scroll", schedule);
+            cancelAnimationFrame(frame);
+        }, { once: true });
     }
 
     function openNextPrompt() {
@@ -6350,8 +6809,15 @@ function inspectOfflineQueue(storage, baseKey) {
             });
             actions.appendChild(button);
         }
-        dialog.append(heading, body);
-        if (textInput) dialog.append(textInput, errorMessage);
+        if (item.options.fitNoteViewport && textInput) {
+            const content = document.createElement("div");
+            content.className = "pbful-note-content";
+            content.append(body, textInput, errorMessage);
+            dialog.append(heading, content);
+        } else {
+            dialog.append(heading, body);
+            if (textInput) dialog.append(textInput, errorMessage);
+        }
         dialog.append(actions);
         dialog.addEventListener("cancel", (event) => { event.preventDefault(); if (!item.running) finish(false); });
         dialog.addEventListener("close", () => {
@@ -6365,6 +6831,7 @@ function inspectOfflineQueue(storage, baseKey) {
         }, { once: true });
         root.appendChild(dialog);
         dialog.showModal();
+        if (item.options.fitNoteViewport && textInput) fitOrderNoteViewport(dialog, actions, textInput);
         // A scanner's Enter must not accidentally confirm a stock operation.
         (textInput || heading).focus({ preventScroll: true });
     }
@@ -6423,14 +6890,20 @@ function inspectOfflineQueue(storage, baseKey) {
             for (let panel = element.parentElement; panel && panel !== root.querySelector('.pbful-modal'); panel = panel.parentElement) {
                 if (!panel.matches('.pbful-detail-layout,.pbful-shell,.pbful-message-drawer') || panel.scrollHeight <= panel.clientHeight + 1) continue;
                 const item = element.getBoundingClientRect(), box = panel.getBoundingClientRect();
-                // The scan bar is sticky inside the list; its actual height changes with zoom.
+                const scale = panel.offsetHeight ? box.height / panel.offsetHeight : 1;
+                if (!(scale > 0)) continue;
+                const view = window.visualViewport;
+                const viewTop = view?.offsetTop || 0;
+                const viewBottom = viewTop + (view?.height || innerHeight);
                 const scanBar = panel.matches('.pbful-detail-layout') ? panel.querySelector(':scope > .pbful-command') : null;
-                const top = Math.max(box.top + panel.clientTop, scanBar?.getBoundingClientRect().bottom ?? box.top);
-                const bottom = box.top + panel.clientTop + panel.clientHeight;
-                if (bottom <= top || (item.bottom > top && item.top < bottom)) continue;
-                const delta = item.top >= bottom && item.height <= bottom - top
-                    ? item.bottom - bottom : item.top - top;
-                panel.scrollBy({top: delta, behavior: 'instant'});
+                const top = Math.max(viewTop, box.top + panel.clientTop * scale, scanBar?.getBoundingClientRect().bottom || 0);
+                const bottom = Math.min(viewBottom, box.top + (panel.clientTop + panel.clientHeight) * scale);
+                if (bottom <= top) continue;
+                if (item.top >= top - 1 && item.bottom <= bottom + 1) continue;
+                const gap = Math.max(0, Math.min(6, (bottom - top - item.height) / 2));
+                const delta = item.top < top || item.height > bottom - top
+                    ? item.top - top - gap : item.bottom - bottom + gap;
+                if (Math.abs(delta) > 1) panel.scrollBy({top:delta / scale, behavior:'instant'});
             }
         });
     }
@@ -7825,7 +8298,7 @@ function inspectOfflineQueue(storage, baseKey) {
         const view = syncView();
         const shared = state.view === "detail" && canPullDetail();
         const canSync = (view.pending.total > 0 || shared) && navigator.onLine && !["syncing"].includes(view.mode);
-        return `<span id="pbful-sync" class="pbful-sync ${view.mode}" aria-live="polite" title="${esc(view.label)}"><i></i><span>${esc(view.label)}</span></span><button id="pbful-sync-now" class="pbful-sync-now" data-act="sync-offline" ${view.pending.total || shared ? "" : "hidden"} ${canSync ? "" : "disabled"}>${t("syncNow")}</button><button data-act="recover-orphan-offline" ${view.pending.total ? "" : "hidden"}>${state.lang === "es" ? "Recuperar pendientes" : "恢复待同步记录"}</button><button id="pbful-review-offline" data-act="review-offline" ${view.pending.current && state.detail && navigator.onLine ? "" : "hidden"}>${state.lang === "es" ? "Revisar pendientes" : "核对待上传数量"}</button><button data-act="withdrawn-history" ${state.detail ? "" : "hidden"}>${state.lang === "es" ? "Historial retirado" : "撤回记录"}</button>`;
+        return `<span id="pbful-sync" class="pbful-sync ${view.mode}" aria-live="polite" title="${esc(view.label)}"><i></i><span>${esc(view.label)}</span></span><button id="pbful-sync-now" class="pbful-sync-now" data-act="sync-offline" ${view.pending.total || shared ? "" : "hidden"} ${canSync ? "" : "disabled"}>${t("syncNow")}</button><button data-act="recover-cancelled-offline" ${view.pending.total && navigator.onLine ? "" : "hidden"}>${state.lang === "es" ? "Revisar entregas canceladas" : "核对已取消交货单"}</button><button data-act="recover-orphan-offline" ${view.pending.total ? "" : "hidden"}>${state.lang === "es" ? "Recuperar pendientes" : "恢复待同步记录"}</button><button id="pbful-review-offline" data-act="review-offline" ${view.pending.current && state.detail && navigator.onLine ? "" : "hidden"}>${state.lang === "es" ? "Revisar pendientes" : "核对待上传数量"}</button><button data-act="withdrawn-history" ${state.detail ? "" : "hidden"}>${state.lang === "es" ? "Historial retirado" : "撤回记录"}</button>`;
     }
 
     function updateSyncIndicator() {
@@ -7877,8 +8350,18 @@ function inspectOfflineQueue(storage, baseKey) {
         return THEMES.map((item) => `<option value="${item.id}" ${state.theme === item.id ? "selected" : ""}>${item.label}${item.recommended ? (state.lang === "es" ? " · Recomendado" : " · 推荐") : ""}</option>`).join("");
     }
 
-    function barcodeBadges(detail, product) {
-        const entries = [...detail.index.entries()].filter(([, hit]) => !hit.ambiguous && Number(hit.productId) === Number(product.id));
+    function barcodeEntriesByProduct(index) {
+        const result = new Map();
+        for (const entry of index) {
+            const hit = entry[1];
+            if (hit.ambiguous) continue;
+            const id = Number(hit.productId);
+            if (!result.has(id)) result.set(id, []);
+            result.get(id).push(entry);
+        }
+        return result;
+    }
+    function barcodeBadges(entries) {
         const counts = entries.reduce((acc, [, hit]) => { acc[hit.source] = (acc[hit.source] || 0) + 1; return acc; }, {});
         const codesFor = (source) => entries.filter(([, hit]) => hit.source === source).map(([code]) => code).join("、");
         const badges = [];
@@ -8014,7 +8497,7 @@ function inspectOfflineQueue(storage, baseKey) {
         stopCamera(); closeImagePreview(); resetScanInputCandidate(false); resetExternalScanBuffer(false); cancelScanFinalization(); clearProductSearch(false);
         productSearchInputElement()?.blur(); pickerNameInputElement()?.blur();
         state.detail = detail; state.view = "detail"; state.session = null; state.productInputFocused = false;
-        state.lastAction = null; state.lastMoveId = null; state.quantityDrafts.clear(); state.moreOpen = false;
+        state.lastAction = null; state.lastMoveId = null; state.quantityDraftBases.clear(); state.quantityDrafts.clear(); state.moreOpen = false;
         state.pickerDraft = suggestedPickerName(); state.exceptionNoteDraft = "";
         setSession(detail.picking.id, null);
     }
@@ -8306,6 +8789,7 @@ function inspectOfflineQueue(storage, baseKey) {
         const picker = state.pickerDraft ?? suggestedPickerName();
         const sourceOwner = d.responsible?.name || t("unassigned");
         const extraEntries = Object.entries(viewTech.extraCounts || {}).filter(([, count]) => Number(count) > 0);
+        const badgeEntries = !table || extraEntries.length ? barcodeEntriesByProduct(d.index) : null;
         const wrongTotal = Core.extraTotal(viewTech);
         const unknownScans = (d.tech.unknownScans || []).slice().reverse();
         return `<div class="pbful-shell" data-view="detail" data-readonly="${readOnly}"><header class="pbful-topbar pbful-detail-head"><button class="pbful-back" data-act="back">← ${t("back")}</button><div class="pbful-detail-title"><strong data-order-note-title title="${esc(orderTitle(d.row))}">${esc(orderTitle(d.row))}</strong><small><span data-order-note-reference ${orderNote(d.row) ? "" : "hidden"}>${esc(d.row.order.pos_reference || d.row.order.name)} · </span>${esc(d.picking.name)} · ${esc(d.row.order.partner_id?.[1] || "-")} · v${esc(VERSION)}</small></div><div class="pbful-detail-tools"><span class="pbful-sync-cluster">${syncIndicatorMarkup()}</span><button class="pbful-quiet ${state.orderNoteErrors.has(orderNoteKey(d.row)) ? "pbful-note-error" : ""}" data-act="order-note" title="${t("orderNoteTitle")}">${t(state.orderNoteErrors.has(orderNoteKey(d.row)) ? "orderNoteSyncFailed" : "note")}</button><button class="pbful-quiet" data-act="lang">${t("language")}</button><details class="pbful-more" ${state.moreOpen ? "open" : ""}><summary>${t("more")}</summary><div><button data-act="camera">${state.camera ? t("stopCamera") : t("camera")}</button><button data-act="refresh-codes" ${state.barcodeSyncing ? "disabled" : ""}>${state.barcodeSyncing ? t("updatingCodes") : t("updateCodes")}</button>${!d.request && !readOnly ? `<button data-native="${d.picking.id}">${t("native")}</button>` : ""}<label><span>${state.lang==='es'?'Lista de productos':'商品布局'}</span><select id="pbful-sheet-mode"><option value="auto">${state.lang==='es'?'Automática':'自动'}</option><option value="always" ${localStorage.getItem('pbful-detail-sheet')==='always'?'selected':''}>${state.lang==='es'?'Siempre en tabla':'始终单行整表'}</option></select></label><label><span>${t("theme")}</span><select id="pbful-theme" aria-label="${t("theme")}">${themeOptions()}</select></label></div></details><button class="pbful-close" data-act="close" aria-label="${t("close")}" title="${t("close")}">×</button></div></header>
@@ -8327,7 +8811,7 @@ function inspectOfflineQueue(storage, baseKey) {
           ${extraEntries.length ? `<section class="pbful-wrong-panel"><div class="pbful-items-head"><div><small>${t("wrongItems")}</small><strong>${wrongTotal}</strong></div><span>${readOnly ? "" : t("wrongHint")}</span></div><div class="pbful-wrong-list">${extraEntries.map(([rawProductId, rawCount]) => {
               const productId = Number(rawProductId); const count = Number(rawCount); const product = productById.get(productId) || { id: productId, display_name: `Product #${productId}` };
               const quantityValue = !salesPaused && state.quantityDrafts.has(`extra:${productId}`) ? state.quantityDrafts.get(`extra:${productId}`) : count;
-              return `<article class="pbful-wrong-line"><img loading="lazy" alt="${esc(product.display_name)}" data-image="${productId}" role="button" tabindex="0" aria-label="${t("imagePreview")} · ${esc(product.display_name)}" src="/web/image/product.product/${productId}/image_128"><div class="pbful-line-name"><strong>${esc(product.default_code || `#${productId}`)}</strong><span title="${esc(product.display_name)}">${esc(product.display_name)}</span><div class="pbful-code-chips">${barcodeBadges(d, product)}</div></div><div class="pbful-wrong-count"><small title="${t("wrongCount")}">${state.lang==='es'?'Error':'错配'}</small><b>${count}</b></div><div class="pbful-step"><button aria-label="${t("decreaseWrong")}" data-extra-dec="${productId}" ${extraQuantityLocked ? "disabled" : ""}>−</button><input id="pbful-extra-qty-${productId}" data-extra-qty-for="${productId}" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done" value="${esc(quantityValue)}" aria-label="${t("wrongCount")}" ${extraQuantityLocked ? "disabled" : ""}><button aria-label="${t("increaseWrong")}" data-extra-inc="${productId}" ${extraQuantityLocked ? "disabled" : ""}>＋</button><button class="pbful-clear-extra" data-extra-clear="${productId}" ${extraQuantityLocked ? "disabled" : ""}>${t("clearQty")}</button></div></article>`;
+              return `<article class="pbful-wrong-line"><img loading="lazy" alt="${esc(product.display_name)}" data-image="${productId}" role="button" tabindex="0" aria-label="${t("imagePreview")} · ${esc(product.display_name)}" src="/web/image/product.product/${productId}/image_128"><div class="pbful-line-name"><strong>${esc(product.default_code || `#${productId}`)}</strong><span title="${esc(product.display_name)}">${esc(product.display_name)}</span><div class="pbful-code-chips">${barcodeBadges(badgeEntries.get(Number(product.id)) || [])}</div></div><div class="pbful-wrong-count"><small title="${t("wrongCount")}">${state.lang==='es'?'Error':'错配'}</small><b>${count}</b></div><div class="pbful-step"><button aria-label="${t("decreaseWrong")}" data-extra-dec="${productId}" ${extraQuantityLocked ? "disabled" : ""}>−</button><input id="pbful-extra-qty-${productId}" data-extra-qty-for="${productId}" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done" value="${esc(quantityValue)}" aria-label="${t("wrongCount")}" ${extraQuantityLocked ? "disabled" : ""}><button aria-label="${t("increaseWrong")}" data-extra-inc="${productId}" ${extraQuantityLocked ? "disabled" : ""}>＋</button><button class="pbful-clear-extra" data-extra-clear="${productId}" ${extraQuantityLocked ? "disabled" : ""}>${t("clearQty")}</button></div></article>`;
           }).join("")}</div></section>` : ""}
           <section class="pbful-items-head"><div><strong>${d.moves.length} ${state.lang === "es" ? "productos" : "项商品"}</strong></div><span>${readOnly ? "" : state.lang === "es" ? "Edite la cantidad · Enter o salir para guardar" : "数量可直接改 · 回车或点空白处保存"}</span></section><section class="pbful-lines" ${table ? 'id="pbful-tablet-list"' : ''}>${table && d.moves.length ? tabletListHeader(readOnly) : ''}${d.moves.map((move) => {
               const productId = Array.isArray(move.product_id) ? move.product_id[0] : move.product_id;
@@ -8335,7 +8819,7 @@ function inspectOfflineQueue(storage, baseKey) {
               const demand = Core.demandOf(move); const scanned = Number(viewTech.counts?.[String(move.id)] || 0); const onhand = Number(d.stock.get(productId) || 0);
               const quantityValue = !salesPaused && state.quantityDrafts.has(`move:${move.id}`) ? state.quantityDrafts.get(`move:${move.id}`) : scanned;
               const remaining = Math.max(0, demand - scanned); const excess = Math.max(0, scanned - demand); const complete = scanned === demand;
-              return `<article class="pbful-line ${onhand < demand ? "low" : ""} ${complete ? "complete" : ""} ${excess ? "over" : ""}" data-move-id="${move.id}" data-stock-shortage="${!requestCancelled && !["done", "cancel"].includes(d.picking.state) && onhand < demand ? Number((demand - onhand).toFixed(6)) : 0}"><img loading="lazy" alt="${esc(product.display_name)}" data-image="${productId}" role="button" tabindex="0" aria-label="${t("imagePreview")} · ${esc(product.display_name)}" src="/web/image/product.product/${productId}/image_128"><div class="pbful-line-name"><div><strong>${esc(product.default_code || t("noReference"))}</strong>${complete && !requestCancelled && d.picking.state !== "cancel" ? `<span class="pbful-line-done">${d.picking.state === "done" ? t("done") : statusLabel("ready")}</span>` : excess ? `<span class="pbful-line-over">${t("excess")} ${excess}</span>` : ""}</div><span title="${esc(product.display_name)}">${esc(product.display_name)}</span>${table ? "" : `<div class="pbful-code-chips">${barcodeBadges(d, product) || `<span class="pbful-code-chip empty">${state.lang === "es" ? "Sin código" : "无可用条码"}</span>`}</div>`}</div><div class="pbful-line-numbers"><span>${t("qty")} <b>${demand}</b></span><span class="${onhand < demand ? "stock-low" : ""}">${t("stock")} <b>${onhand}</b></span><span class="${excess ? "quantity-over" : ""}">${excess ? t("excess") : t("remaining")} <b>${excess || remaining}</b></span></div><div class="pbful-step"><button aria-label="${t("decrease")}" data-dec="${move.id}" ${quantityLocked || scanned <= 0 ? "disabled" : ""}>−</button><input id="pbful-qty-${move.id}" data-qty-for="${move.id}" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done" value="${esc(quantityValue)}" aria-label="${esc(product.default_code || product.display_name)} · ${t("setQty")}" title="${t("setQty")}" ${quantityLocked ? "disabled" : ""}><button aria-label="${t("increase")}" data-inc="${move.id}" ${quantityLocked ? "disabled" : ""}>＋</button></div></article>`;
+              return `<article class="pbful-line ${onhand < demand ? "low" : ""} ${complete ? "complete" : ""} ${excess ? "over" : ""}" data-move-id="${move.id}" data-stock-shortage="${!requestCancelled && !["done", "cancel"].includes(d.picking.state) && onhand < demand ? Number((demand - onhand).toFixed(6)) : 0}"><img loading="lazy" alt="${esc(product.display_name)}" data-image="${productId}" role="button" tabindex="0" aria-label="${t("imagePreview")} · ${esc(product.display_name)}" src="/web/image/product.product/${productId}/image_128"><div class="pbful-line-name"><div><strong>${esc(product.default_code || t("noReference"))}</strong>${complete && !requestCancelled && d.picking.state !== "cancel" ? `<span class="pbful-line-done">${d.picking.state === "done" ? t("done") : statusLabel("ready")}</span>` : excess ? `<span class="pbful-line-over">${t("excess")} ${excess}</span>` : ""}</div><span title="${esc(product.display_name)}">${esc(product.display_name)}</span>${table ? "" : `<div class="pbful-code-chips">${barcodeBadges(badgeEntries.get(Number(product.id)) || []) || `<span class="pbful-code-chip empty">${state.lang === "es" ? "Sin código" : "无可用条码"}</span>`}</div>`}</div><div class="pbful-line-numbers"><span>${t("qty")} <b>${demand}</b></span><span class="${onhand < demand ? "stock-low" : ""}">${t("stock")} <b>${onhand}</b></span><span class="${excess ? "quantity-over" : ""}">${excess ? t("excess") : t("remaining")} <b>${excess || remaining}</b></span></div><div class="pbful-step"><button aria-label="${t("decrease")}" data-dec="${move.id}" ${quantityLocked || scanned <= 0 ? "disabled" : ""}>−</button><input id="pbful-qty-${move.id}" data-qty-for="${move.id}" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done" value="${esc(quantityValue)}" aria-label="${esc(product.default_code || product.display_name)} · ${t("setQty")}" title="${t("setQty")}" ${quantityLocked ? "disabled" : ""}><button aria-label="${t("increase")}" data-inc="${move.id}" ${quantityLocked ? "disabled" : ""}>＋</button></div></article>`;
           }).join("")}</section>
           <section class="pbful-issue-panel">${readOnly ? renderExceptionHistory(d) : ""}<div class="pbful-items-head"><div><small>${t("issueArea")}</small><strong>${d.tech.exception?.active ? esc(d.tech.exception.reason) : t("exceptionBtn")}</strong></div>${d.tech.exception?.active ? `<span>${esc(d.tech.exception.note || "")}</span>` : ""}</div><div class="pbful-exception"><select id="pbful-exception-reason" aria-label="${state.lang === "es" ? "Motivo de la incidencia" : "异常原因"}"><option value="缺货" ${state.exceptionReasonDraft === "缺货" ? "selected" : ""}>${t("reasonShortage")}</option><option value="找不到货" ${state.exceptionReasonDraft === "找不到货" ? "selected" : ""}>${t("reasonMissing")}</option><option value="商品损坏" ${state.exceptionReasonDraft === "商品损坏" ? "selected" : ""}>${t("reasonDamaged")}</option><option value="库存位置错误" ${state.exceptionReasonDraft === "库存位置错误" ? "selected" : ""}>${t("reasonLocation")}</option><option value="其他" ${state.exceptionReasonDraft === "其他" ? "selected" : ""}>${t("reasonOther")}</option></select><input id="pbful-exception-note" aria-label="${t("note")}" value="${esc(state.exceptionNoteDraft)}" placeholder="${t("note")}"><button class="danger" data-act="exception">${t("exceptionBtn")}</button>${d.tech.exception?.active ? `<button data-act="resolve">${t("resolve")}</button>` : ""}</div>${unknownScans.length ? `<div class="pbful-unknown-log"><div class="pbful-unknown-title"><strong>${t("unknownHistory")}</strong><small>${unknownScans.length}</small></div><div class="pbful-unknown-items">${unknownScans.map((item) => `<span><code>${esc(item.code)}</code><small>${esc(shortDate(item.at))} · ${esc(item.picker || "-")}</small><button class="pbful-delete-unknown" data-unknown-delete="${esc(item.id)}" aria-label="${t("deleteRecord")}" title="${t("deleteRecord")}" ${!state.session ? "disabled" : ""}>×</button></span>`).join("")}</div></div>` : ""}</section></main>
         </div>`;
@@ -8367,7 +8851,6 @@ function inspectOfflineQueue(storage, baseKey) {
         const waiting = root.querySelector(".pbful-waiting-banner");
         const freshWaiting = template.content.querySelector(".pbful-waiting-banner");
         if (waiting && freshWaiting) waiting.replaceWith(freshWaiting);
-        if (state.lastMoveId != null) layout.querySelector(`[data-move-id="${Number(state.lastMoveId)}"]`)?.classList.add("scan-hit");
         state.lastMoveId = null;
         updateScanQueueIndicator();
         enhanceFulfillmentUi();
@@ -8386,8 +8869,9 @@ function inspectOfflineQueue(storage, baseKey) {
         }
 
         const editor = focusedFulfillmentEditor();
-        const editing = editor?.matches?.("input,textarea,select") && !editor.disabled &&
-            (editor !== productSearchInputElement() || editor.value || state.scanInputCandidate?.chars);
+        const scannerSink = state.scanOnly && editor?.hasAttribute('data-scan-only-input') ? editor : null;
+        const editing = !scannerSink && editor?.matches?.("input,textarea,select") && !editor.disabled &&
+            (editor !== productSearchInputElement() || editor.value || nativeDetailEditor === editor || state.scanInputCandidate?.chars);
         // Never replace a focused native editor: that destroys the caret, selection and Android IME.
         // The server state still updates; only its full visual repaint waits until editing ends.
         if (!blocked && state.open && root.querySelector(".pbful-shell")?.dataset.view === state.view &&
@@ -8409,9 +8893,16 @@ function inspectOfflineQueue(storage, baseKey) {
         const previousView = previousShell?.dataset.view || "";
         const previousScroll = previousShell?.scrollTop || 0;
         const previousDetailScroll = root.querySelector(".pbful-detail-layout")?.scrollTop || 0;
-        const renderedMoveId = state.lastMoveId;
         rememberStatusTabViewport();
-        root.querySelector(".pbful-modal").innerHTML = state.view === "detail" ? renderDetail() : renderDashboard();
+        const modal = root.querySelector(".pbful-modal");
+        const markup = state.view === "detail" ? renderDetail() : renderDashboard();
+        if (state.open && state.view === "detail" && !blocked && scannerSink?.parentNode === modal) {
+            // Keep the active keyboard wedge attached while repainting the server-confirmed counts.
+            for (const child of [...modal.childNodes]) if (child !== scannerSink) child.remove();
+            scannerSink.insertAdjacentHTML('beforebegin', markup);
+        } else {
+            modal.innerHTML = markup;
+        }
         if(isColorWorkspaceView()) queueMicrotask(mountColorModule);
         syncProductSearchInput();
         syncOrderSearchInput();
@@ -8427,14 +8918,12 @@ function inspectOfflineQueue(storage, baseKey) {
         if (!localStorage.getItem("pbful_reference_v32")) { localStorage.setItem("pbful_reference_v32","1"); localStorage.setItem(LS.theme,state.theme); }
         overlay.lang = state.lang === "es" ? "es" : "zh-CN";
         overlay.setAttribute("aria-hidden", String(!state.open));
-        const modal = root.querySelector(".pbful-modal");
         modal.setAttribute("aria-label", t("title"));
         if (CAN_WINDOW_GESTURE) modal.insertAdjacentHTML("beforeend", `<span class="pbful-resize-handle" data-window-resize="se" aria-label="${t("resizeWindow")}" title="${t("resizeWindow")}"><img class="pbful-resize-icon" alt="" aria-hidden="true" draggable="false" src="${REFERENCE_ICONS["arrows-diagonal-2"]}"></span>`);
         applySavedWindowRect();
         const nextShell = root.querySelector(".pbful-shell");
         if (previousView && nextShell?.dataset.view !== previousView) nextShell.classList.add("pbful-view-enter");
         if (state.view === "detail" && nextShell) nextShell.dataset.picking = String(state.detail?.picking.id ?? "");
-        if (renderedMoveId != null) root.querySelector(`[data-move-id="${Number(renderedMoveId)}"]`)?.classList.add("scan-hit");
         const launch = document.getElementById("pbful-launch");
         if (launch) { launch.textContent = t("orders"); launch.hidden = state.open; launch.setAttribute("aria-expanded", String(state.open)); }
         if (activeId && !state.activePrompt && !state.imagePreview) {
@@ -8532,7 +9021,7 @@ function inspectOfflineQueue(storage, baseKey) {
                 state.detail.index = Core.productCodeIndex(state.detail.products, state.boxMappings, state.detail.systemCodes);
                 state.detail.boxCodesLoadedAt = state.boxLoadedAt;
                 state.detail.boxCodeCount = new Set(state.boxMappings.filter(item => item.enabled).map(item => Core.normalizeCode(item.boxCode)).filter(Boolean)).size;
-            } state.view = "detail"; state.session = getSessions()[state.detail.picking.id] || null; state.lastAction = null; state.lastMoveId = null; state.quantityDrafts.clear(); state.exceptionNoteDraft = ""; state.exceptionReasonDraft = "缺货"; state.pickerDraft = suggestedPickerName();
+            } state.view = "detail"; state.session = getSessions()[state.detail.picking.id] || null; state.lastAction = null; state.lastMoveId = null; state.quantityDraftBases.clear(); state.quantityDrafts.clear(); state.exceptionNoteDraft = ""; state.exceptionReasonDraft = "缺货"; state.pickerDraft = suggestedPickerName();
             if (!Core.verifyLock(state.detail.tech, state.session)) state.session = null;
             if (state.detail.request?.x_pb_state === "cancelled") state.session = null;
             if (isReadOnlyDetail()) enterReadOnlyDetail(state.detail);
@@ -8617,13 +9106,22 @@ function inspectOfflineQueue(storage, baseKey) {
             const input = productSearchInputElement();
             if (!input) return;
             const activeEditor = focusedFulfillmentEditor();
-            if (!force && activeEditor && activeEditor !== input) return;
+            if (activeEditor && activeEditor !== input && (!force || activeEditor === nativeDetailEditor)) return;
             state.productInputFocused = true;
             input.focus({ preventScroll: true });
         }, 50);
     }
     let detailExitPending = false;
 
+    // A browser may discard a page without awaiting JS. Only warn about work
+    // not yet durably recorded. Mobile process termination cannot be intercepted.
+    window.addEventListener('beforeunload', event => {
+        if (state.view !== 'detail') return;
+        if (state.scanProcessing || state.scanQueue.length || state.quantityDrafts.size || state.validationAction) {
+            event.preventDefault();
+            event.returnValue = '';
+        }
+    });
     async function canLeaveDetail() {
         if (detailExitPending) return false;
         if (state.bulkAction) { toast(t("bulkBusy"), "warn"); return false; }
@@ -8657,7 +9155,7 @@ function inspectOfflineQueue(storage, baseKey) {
                     confirmLabel: state.lang === "es" ? "Descartar y volver" : "放弃修改并返回",
                 });
                 if (!discard || !sameDetail()) return false;
-                state.quantityDrafts.clear();
+                state.quantityDraftBases.clear(); state.quantityDrafts.clear();
             }
             return false;
         } finally {
@@ -8945,7 +9443,14 @@ function inspectOfflineQueue(storage, baseKey) {
         root.addEventListener("toggle", (event) => {
             if (event.target.matches?.(".pbful-more") && event.target.isConnected) state.moreOpen = event.target.open;
         }, true);
+        root.addEventListener("focusin", event => showTouchQuantity(event.target));
         root.addEventListener("focusout", (event) => {
+            if (quantityInputKey(event.target)) {
+                root.querySelector('[data-quantity-preview]')?.removeAttribute('data-quantity-preview');
+                if (touchQuantityField === event.target) touchQuantityField = null;
+            }
+            if (nativeDetailEditor === event.composedPath()[0]) nativeDetailEditor = null;
+            if (imeDetailEditor === event.composedPath()[0]) imeDetailEditor = null;
             commitQuantityInput(event.target);
             setTimeout(() => { if (state.renderPending && !state.activePrompt) render(); }, 0);
         });
@@ -8956,8 +9461,9 @@ function inspectOfflineQueue(storage, baseKey) {
         }
         root.addEventListener("input", (event) => {
             const target = event.target;
-            if (target?.dataset?.qtyFor) state.quantityDrafts.set(`move:${target.dataset.qtyFor}`, target.value);
-            else if (target?.dataset?.extraQtyFor) state.quantityDrafts.set(`extra:${target.dataset.extraQtyFor}`, target.value);
+            showTouchQuantity(target);
+            if (target?.dataset?.qtyFor) rememberQuantityDraft(`move:${target.dataset.qtyFor}`, target.value);
+            else if (target?.dataset?.extraQtyFor) rememberQuantityDraft(`extra:${target.dataset.extraQtyFor}`, target.value);
             else if (target?.id === "pbful-exception-note") state.exceptionNoteDraft = target.value;
         });
         root.addEventListener("click", async (event) => {
@@ -8971,8 +9477,9 @@ function inspectOfflineQueue(storage, baseKey) {
             try {
                 if (act === 'confirm-packed') await confirmPacked();
                 else if (act === "close") await closeOverlay();
-                else if (act === "back") { if (!await canLeaveDetail()) return; stopCamera(); resetScanInputCandidate(false); resetExternalScanBuffer(false); cancelScanFinalization(); clearProductSearch(false); productSearchInputElement()?.blur(); pickerNameInputElement()?.blur(); state.productInputFocused = false; state.messageDrawerOpen = false; state.messageDrawerDismissed = false; state.messagePaneTyped = false; state.view = "dashboard"; state.detail = null; state.session = null; state.pickerDraft = null; state.lastAction = null; state.lastMoveId = null; state.quantityDrafts.clear(); state.exceptionNoteDraft = ""; workspaceNavigation.restoreReturn();render(); await refresh(true); }
+                else if (act === "back") { if (!await canLeaveDetail()) return; stopCamera(); resetScanInputCandidate(false); resetExternalScanBuffer(false); cancelScanFinalization(); clearProductSearch(false); productSearchInputElement()?.blur(); pickerNameInputElement()?.blur(); state.productInputFocused = false; state.messageDrawerOpen = false; state.messageDrawerDismissed = false; state.messagePaneTyped = false; state.view = "dashboard"; state.detail = null; state.session = null; state.pickerDraft = null; state.lastAction = null; state.lastMoveId = null; state.quantityDraftBases.clear(); state.quantityDrafts.clear(); state.exceptionNoteDraft = ""; workspaceNavigation.restoreReturn();render(); await refresh(true); }
                 else if (act === "refresh") { invalidateDashboardIndex(); await refresh(); }
+                else if (act === "recover-cancelled-offline") await recoverCancelledOffline();
                 else if (act === "recover-orphan-offline") await recoverOrphanOffline();
                 else if (act === "review-offline") await reviewPendingOffline();
                 else if (act === "withdrawn-history") await showWithdrawnOfflineHistory();
@@ -9127,7 +9634,8 @@ function inspectOfflineQueue(storage, baseKey) {
             input.value = value;
             if (supportsTextSelection(input)) input.setSelectionRange(burst.start + burst.text.length, burst.start + burst.text.length);
         }
-        state.quantityDrafts.set(burst.key, value);
+        rememberQuantityDraft(burst.key, value);
+        showTouchQuantity(input);
         if ((commit || burst.commit) && input) commitQuantityInput(input);
         return true;
     }
@@ -9163,6 +9671,31 @@ function inspectOfflineQueue(storage, baseKey) {
         }, 220);
     }
 
+    // Touch editing and Android IME text are already edited by the browser.
+    // A physical wedge still follows the separate, terminated keydown path.
+    let nativeDetailEditor = null;
+    let imeDetailEditor = null;
+    let touchQuantityField = null;
+    function showTouchQuantity(input) {
+        if (!input || input !== touchQuantityField || root?.activeElement !== input || input.disabled) return;
+        const search = root.querySelector('.pbful-product-search');
+        const label = input.closest('article')?.querySelector('.pbful-line-name strong')?.textContent;
+        if (!search || !label) return;
+        const caption = input.dataset.extraQtyFor ? t('wrongCount') : t('scanned');
+        search.dataset.quantityPreview = label + ' · ' + caption + ' ' + (input.value || '—');
+    }
+    function isDetailTextField(target) {
+        return Boolean(target && (target === productSearchInputElement() || quantityInputKey(target)));
+    }
+    window.addEventListener('pointerdown', event => {
+        const target = event.composedPath()[0];
+        touchQuantityField = state.open && state.view === 'detail' && event.pointerType === 'touch' &&
+            quantityInputKey(target) ? target : null;
+        if (touchQuantityField) showTouchQuantity(target);
+        imeDetailEditor = null;
+        nativeDetailEditor = state.open && state.view === 'detail' &&
+            isDetailTextField(target) ? target : null;
+    }, true);
     function guardedInputEvent(event) {
         if (!state.open || state.view !== 'detail') return false;
         if (state.discardScannerTail && !state.scanAlert) {
@@ -9179,6 +9712,27 @@ function inspectOfflineQueue(storage, baseKey) {
         if (state.activePrompt || state.imagePreview || isReadOnlyDetail()) return false;
         const target = event.composedPath?.()[0] || event.target;
         if (guardScanOnlyInput(event, target)) return true;
+        if (!state.scanOnly && isDetailTextField(target)) {
+            if (event.isComposing || event.keyCode === 229 || event.key === 'Unidentified' ||
+                event.inputType?.includes('Composition')) {
+                nativeDetailEditor = target;
+                imeDetailEditor = event.type === 'keyup' || event.type === 'input' ? null : target;
+                resetScanInputCandidate(false);
+                if (event.type.startsWith('key')) {
+                    event.stopImmediatePropagation();
+                    return true;
+                }
+                return false;
+            }
+            // Untagged quantity bursts may be a keyboard wedge. Keep their
+            // original frame guard so an entire barcode cannot become a quantity.
+            if (nativeDetailEditor === target && (!quantityInputKey(target) || imeDetailEditor === target) &&
+                ['beforeinput', 'input'].includes(event.type) && !isScanTerminator(event)) {
+                if (event.type === 'input') imeDetailEditor = null;
+                if (state.quantityInputBurst) finishQuantityBurst(false);
+                return false;
+            }
+        }
         if (guardSearchInputEvent(event, target)) return true;
         const quantity = quantityInputKey(target) ? target : state.quantityInputBurst?.input;
         if (!quantity) return false;
@@ -9293,6 +9847,11 @@ function inspectOfflineQueue(storage, baseKey) {
     function scanErrorPresentation(kind) {
         const es = state.lang === 'es';
         const copy = {
+            LOCAL_SAVE_FAILED: {
+                zh:['本机保存失败','请检查浏览器可用空间。恢复后先核对本机待同步记录，再处理这次输入。','暂停扫码','本次输入','本次商品未计数，恢复后请重扫。','已核对，继续'],
+                es:['No se pudo guardar en este equipo','Revise el espacio disponible. Al recuperarlo, compruebe los pendientes antes de continuar.','Escaneo pausado','Entrada','Producto sin contar. Vuelva a escanearlo tras recuperar el espacio.','Revisado, continuar'],
+                tone:'warning',showProduct:false,
+            },
             LOOKUP_PENDING: {
                 zh:['正在核对条码','正在查询小盒码或商品资料，请稍候再扫下一件。','等待核对','本次扫码','尚未增加数量；核对后会自动继续或显示具体错误。','正在核对，请稍候'],
                 es:['Verificando el código','Consultando cajas o productos. Espere antes de escanear el siguiente.','Verificando','Código escaneado','Aún no se agregó ninguna cantidad. Se continuará o mostrará el error al terminar.','Espere la verificación'],
@@ -9406,7 +9965,7 @@ function inspectOfflineQueue(storage, baseKey) {
             const move = state.detail?.moves.find(item => Number(item.id) === Number(op.moveId));
             const productId = op.productId || m2oId(move?.product_id);
             const product = state.detail?.products.find(item => Number(item.id) === Number(productId)) || op.productSnapshot;
-            pauseScanForError(error, {code:op.code || 'MANUAL', product, noCount:['WRONG_PRODUCT','OVER_SCAN','UNKNOWN_BARCODE','AMBIGUOUS_BARCODE','INCOMPLETE_SCAN'].includes(error.code), manual:!op.scannerInput, operation:op});
+            pauseScanForError(error, {code:op.code || 'MANUAL', product, noCount:['WRONG_PRODUCT','OVER_SCAN','UNKNOWN_BARCODE','AMBIGUOUS_BARCODE','INCOMPLETE_SCAN','LOCAL_SAVE_FAILED'].includes(error.code), manual:!op.scannerInput, operation:op});
         } else if (error.code === 'SCAN_ONLY') toast(error.message, 'warn');
         return Promise.resolve({ok:false, error, guardRejected:true});
     }
@@ -9431,7 +9990,7 @@ function inspectOfflineQueue(storage, baseKey) {
             const AudioContextClass=PAGE_WINDOW.AudioContext || PAGE_WINDOW.webkitAudioContext;
             if (!AudioContextClass) return;
             scanErrorAudio ||= new AudioContextClass();
-            if (scanErrorAudio.state==='suspended') void scanErrorAudio.resume().catch(()=>{});
+            if (scanErrorAudio.state !== 'running' && scanErrorAudio.state !== 'closed') void scanErrorAudio.resume().catch(()=>{});
             if (!scanErrorBufferPromise) {
                 const probe=new PAGE_WINDOW.Audio();
                 const ext=probe.canPlayType('audio/ogg; codecs=vorbis')?'.ogg':'.mp3';
@@ -9446,36 +10005,52 @@ function inspectOfflineQueue(storage, baseKey) {
         } catch (_) { /* A failed sound cannot change scan acceptance. */ }
     }
 
-    function playScanErrorSound() {
+    let soundRequest = 0;
+    async function playScanErrorSound() {
+        const request = ++soundRequest;
+        const expires = performance.now() + 1000;
+        let timer;
         try {
             primeScanErrorAudio();
             const audio=scanErrorAudio, bufferPromise=scanErrorBufferPromise;
-            if(!audio||!bufferPromise)return;
-            const resume=audio.state==='suspended'?audio.resume():Promise.resolve();
-            Promise.all([resume,bufferPromise]).then(([,buffer])=>{
-                if(audio.state!=='running')return;
+            if(!audio||!bufferPromise)return false;
+            const resume=audio.state!=='running'?audio.resume():Promise.resolve();
+            const buffer = await Promise.race([
+                Promise.all([resume,bufferPromise]).then(([,decoded])=>decoded),
+                new Promise(resolve=>{timer=setTimeout(()=>resolve(null),1000);})
+            ]);
+            if (request !== soundRequest || performance.now() > expires || !buffer || audio.state !== 'running') return false;
+            {
                 // Match POS replay semantics: a new error restarts the recording.
                 if(scanErrorSource){try{scanErrorSource.stop();}catch(_){}scanErrorSource.disconnect();}
                 const source=audio.createBufferSource();source.buffer=buffer;source.connect(audio.destination);
                 scanErrorSource=source;
                 source.onended=()=>{source.disconnect();if(scanErrorSource===source)scanErrorSource=null;};
                 source.start();
-            }).catch(()=>{});
-        } catch (_) { /* Keep the visual prompt when the device cannot play audio. */ }
+                return true;
+            }
+        } catch (_) { return false; }
+        finally { clearTimeout(timer); }
     }
 
     function notifyScanRejection(message) {
         const text = String(message || '');
-        playScanErrorSound();
+        const sound = playScanErrorSound();
+        const request = soundRequest;
         recordInterfaceMessage(text, 'error');
         refreshMessageHistory();
         let notice=document.getElementById('pbful-scan-rejection-toast');
         if (!notice) {
             notice=document.createElement('div');notice.id='pbful-scan-rejection-toast';notice.setAttribute('role','alert');
-            notice.style.cssText='position:fixed;top:70px;right:16px;z-index:2147483647;max-width:min(420px,calc(100vw - 32px));padding:14px 18px;border:1px solid #e6b6bc;border-left:5px solid #b42337;border-radius:7px;background:#fff1f2;color:#842032;box-shadow:0 5px 20px #0002;font:600 15px/1.5 system-ui;pointer-events:none;white-space:pre-wrap;overflow-wrap:anywhere';
+            notice.style.cssText='position:fixed;top:70px;right:16px;z-index:2147483647;max-width:min(420px,calc(100vw - 32px));padding:14px 18px;border:1px solid #e6b6bc;border-left:5px solid #b42337;border-radius:7px;background:#8f182c;color:#fff;box-shadow:0 5px 20px #0002;font:600 15px/1.5 system-ui;pointer-events:none;white-space:pre-wrap;overflow-wrap:anywhere';
             document.body.append(notice);
         }
-        notice.textContent=text;
+        notice.textContent = text;
+        sound.then(played => {
+            if (!played && request === soundRequest && notice.isConnected) {
+                notice.textContent += state.lang === 'es' ? ' · Sonido no disponible.' : ' · 本次提示音未播放。';
+            }
+        });
         clearTimeout(scanErrorToastTimer);
         scanErrorToastTimer=setTimeout(()=>notice.remove(),3500);
     }
@@ -9522,6 +10097,8 @@ function inspectOfflineQueue(storage, baseKey) {
             notifyScanRejection(note);
             return null;
         }
+        if (error.code === 'LOCAL_SAVE_FAILED')
+            setScanFeedback(scanErrorPresentation(error.code).title,'warn',context);
         const dropped = discardPendingScans();
         closeImagePreview(false);
         const alert = state.scanAlert = {id:Core.makeId('scan_error'), context:{...context,allowNoSession:['DEMAND_CHANGED','LOCK_LOST','TERMINAL','SHARED_STATE_LOST'].includes(error.code)}, error, code:String(info.code || ''),
@@ -9710,13 +10287,13 @@ function inspectOfflineQueue(storage, baseKey) {
             const button=document.createElement('button');button.type='button';button.className='pbful-scan-mode';button.dataset.scanMode='toggle';tools.prepend(button);
         }
         const toggle=tools?.querySelector('[data-scan-mode]');
-        if (toggle) {toggle.textContent=state.scanOnly?(es?'Solo escaneo · Activado':'专属扫码 · 已开启'):(es?'Solo escaneo':'专属扫码');toggle.setAttribute('aria-pressed',String(state.scanOnly));toggle.disabled=Boolean(state.scanAlert || isReadOnlyDetail());}
+        if (toggle) {toggle.textContent=state.scanOnly?(es?'Solo escaneo · Tocar para escribir':'专属扫码 · 点此恢复手输'):(es?'Solo escaneo':'专属扫码');toggle.setAttribute('aria-pressed',String(state.scanOnly));toggle.disabled=Boolean(state.scanAlert || isReadOnlyDetail());}
         const input=productSearchInputElement();
         if (input) {input.disabled=Boolean(state.scanOnly || state.scanAlert || isReadOnlyDetail()); input.inputMode=state.scanOnly?'none':'text';}
         const command=shell.querySelector('.pbful-command');
         let status=command?.querySelector('.pbful-scan-only-status');
         if (command && !status) {status=document.createElement('div');status.className='pbful-scan-only-status';status.setAttribute('role','status');command.prepend(status);}
-        if (status) {status.hidden=!state.scanOnly;status.textContent=es?'Listo para escanear · Búsqueda y edición bloqueadas':'等待扫码 · 商品搜索和手工改数量已锁定';}
+        if (status) {status.hidden=!state.scanOnly;status.textContent=es?'Para buscar o editar, desactive Solo escaneo.':'要搜索或改数量，请点上方「恢复手输」。';}
         const manual='[data-qty-for],[data-extra-qty-for],[data-inc],[data-dec],[data-set-qty],[data-extra-inc],[data-extra-dec],[data-extra-set],[data-extra-clear],[data-product-add],[data-act="manual-scan"],[data-act="undo"],[data-act="bulk-clear"],[data-act="bulk-fill"],[data-act="bulk-undo"]';
         if (state.scanOnly || state.scanAlert) for(const control of shell.querySelectorAll(manual)) control.disabled=true;
         const searchButton=shell.querySelector('[data-act="manual-scan"]');if(searchButton)searchButton.textContent=es?'Buscar':'搜索';
@@ -10196,8 +10773,10 @@ function inspectOfflineQueue(storage, baseKey) {
                 rememberPrepickMarker(uuid, { requestId, state: request.x_pb_state, cancelPending: false });
                 throw new Error(state.lang === "es" ? "El surtido ya está pagado o vinculado a una entrega." : "任务已付款或已关联正式交货单，不能按预配货取消。");
             }
-            const orders = await searchRead("pos.order", [["uuid", "=", uuid]], ["id", "uuid", "state"], { limit: 2 });
-            if (orders.length > 1 || orders.some(o => !["draft", "cancel"].includes(o.state))) {
+            const fromCancelledBridge = source === 'cancelled_bridge_reconcile';
+            const orderFields = fromCancelledBridge ? ['id','uuid','state','payment_ids','picking_ids'] : ['id','uuid','state'];
+            const orders = await searchRead("pos.order", [["uuid", "=", uuid]], orderFields, { limit: 2 });
+            if ((fromCancelledBridge && !cancelledUnpaidCart(orders)) || orders.length > 1 || orders.some(o => !["draft", "cancel"].includes(o.state))) {
                 rememberPrepickMarker(uuid, { requestId, cancelPending: false });
                 throw new Error(state.lang === "es" ? "Revise el pago del pedido antes de cancelar." : "POS 订单已付款或状态不明确，不能取消预配货。");
             }
@@ -10208,13 +10787,16 @@ function inspectOfflineQueue(storage, baseKey) {
                 rememberPrepickMarker(uuid, { requestId, state: "cancelled", cancelPending: false }); prepickSaved(); return request;
             }
             const bridge = bridgePayload(request);
+            if (fromCancelledBridge && (!bridge || request.x_pb_state !== 'bridge_wait'))
+                throw bridgeError('配货关联已变化，请刷新核对。','Cambió el vínculo del surtido. Actualice para revisarlo.');
+
             if (request.x_pb_state !== "draft" && !(bridge && request.x_pb_state === "bridge_wait")) throw new Error("任务状态不允许取消预配货");
             const values = bridge ? { x_pb_state: "bridge_detached" } : {
                 x_pb_state: "cancelled", x_pb_cancelled_at: Core.odooDateTime(new Date().toISOString()), x_pb_cancel_ack: false, x_pb_version: Number(request.x_pb_version || 0) + 1,
             };
             // Final payment check after reading fresh request state; server-side atomicity still requires backend support.
-            const latestOrders = await searchRead("pos.order", [["uuid", "=", uuid]], ["id", "uuid", "state"], { limit: 2 });
-            if (latestOrders.length > 1 || latestOrders.some(o => !["draft", "cancel"].includes(o.state))) {
+            const latestOrders = await searchRead("pos.order", [["uuid", "=", uuid]], orderFields, { limit: 2 });
+            if ((fromCancelledBridge && !cancelledUnpaidCart(latestOrders)) || latestOrders.length > 1 || latestOrders.some(o => !["draft", "cancel"].includes(o.state))) {
                 rememberPrepickMarker(uuid, { requestId, cancelPending: false, cancelAwaitingSend: false });
                 throw new Error(state.lang === 'es' ? 'El pago cambió; no se canceló el surtido.' : '付款状态已变化，未取消配货任务。');
             }
@@ -10283,9 +10865,9 @@ function inspectOfflineQueue(storage, baseKey) {
         await discoverFields();
         const picking = await readOne("stock.picking", pickingId, ["id", "name", "state", "move_ids", state.fieldMap.tech]);
         if (!picking || ["done", "cancel"].includes(picking.state)) throw new Error(pbUiText("正式交货单已完成或取消，无法迁移预配货进度","La entrega está terminada o cancelada. No se puede transferir el avance del presurtido."));
-        const moves = await searchRead("stock.move", [["picking_id", "=", Number(pickingId)], ["state", "!=", "cancel"]], [
+        const moves = await readAll("stock.move", [["picking_id", "=", Number(pickingId)], ["state", "!=", "cancel"]], [
             "id", "picking_id", "product_id", "product_uom_qty", "quantity", "has_tracking", "picked", "state",
-        ], { order: "id", limit: 1000 });
+        ], 1000);
         const requestMoves = prepickMoves(request);
         let tech = sourceTech || prepickTech(request, requestMoves);
         if (!sourceTech && Core.isSharedMode(tech)) {
@@ -10616,7 +11198,19 @@ async function fulfillmentPay() {
                     return true;
                 }}]});
             if(accepted!==false&&active())await PAGE_WINDOW.posmodel.pay();
-        }finally{state.fulfillmentPayBusy=false;state.fulfillmentPayUuid='';updatePosPrepickControl();}
+        } catch (error) {
+            const message = error?.message || String(error);
+            toast(message, 'error');
+            if (active()) {
+                await showPrompt(message, 'info', {
+                    title: state.lang === 'es' ? 'Cobro para surtido' : '配货收款',
+                });
+            }
+        } finally {
+            state.fulfillmentPayBusy = false;
+            state.fulfillmentPayUuid = '';
+            updatePosPrepickControl();
+        }
     }
     function removePosNotice() {
         if (state.activePrompt?.options.posNotice) state.activePrompt.close(false);
@@ -11168,7 +11762,6 @@ async function fulfillmentPay() {
           ${s} .pbful-more>div button,${s} .pbful-more>div select{min-height:42px;font-size:13px}
           ${s} .pbful-detail-tools .pbful-quiet{color:inherit;background:#8882;border-color:#8885}
           ${s} .pbful-line,${s} .pbful-line button{transition:background-color 100ms;transform:none;animation:none}
-          ${s} .pbful-line.scan-hit{outline:2px solid var(--pb-success);outline-offset:-2px}
           @container(max-width:619px){
             ${s} .pbful-detail-summary{grid-template-columns:minmax(0,1fr) auto;gap:5px 8px}
             ${s} .pbful-compact-progress{grid-column:1/-1;display:flex;flex-wrap:nowrap}
@@ -11260,6 +11853,13 @@ async function fulfillmentPay() {
           }
           @media(pointer:coarse){${s} .pbful-step button,${s} .pbful-step input,${s} .pbful-more>summary{min-height:44px;height:44px}}
           .pbful-prompt{position:fixed;width:min(460px,calc(100vw - 28px));max-height:calc(100dvh - 32px);margin:auto;overflow:auto;border:1px solid #cfc5cc;border-radius:12px;padding:20px;background:#fff;color:#292429;font:15px/1.6 system-ui,"Microsoft YaHei",sans-serif;box-shadow:0 24px 70px #0005}
+          .pbful-viewport-note[open]{inset:auto;left:var(--note-center-x);top:var(--note-center-y);transform:translate(-50%,-50%);margin:0;box-sizing:border-box;width:min(502px,calc(var(--note-width) - 24px));max-width:none;max-height:calc(var(--note-height) - 12px);display:flex;flex-direction:column;overflow:hidden}
+          .pbful-viewport-note>.pbful-note-content{min-height:0;overflow:auto;overscroll-behavior:contain;padding:3px}
+          .pbful-viewport-note>h2,.pbful-viewport-note>.pbful-prompt-actions{flex:none}
+          .pbful-viewport-note .pbful-note-error-message:empty{display:none}
+          .pbful-prompt.pbful-short-note{padding:10px 14px}
+          .pbful-short-note>h2{margin-bottom:2px;font-size:18px}
+          .pbful-short-note .pbful-note-input,.pbful-short-note>.pbful-prompt-actions{margin-top:6px}
           .pbful-prompt::backdrop{background:#15101888}
           .pbful-prompt h2{margin:0 0 10px;font-size:20px;line-height:1.4;outline:none}
           .pbful-prompt #pbful-prompt-message{white-space:pre-wrap;overflow-wrap:anywhere}
@@ -11686,6 +12286,12 @@ async function fulfillmentPay() {
 
           /* One stable input supports exact scanner codes and full Odoo product search. */
           .pbful-overlay .pbful-command{overflow:visible}
+          .pbful-product-search[data-quantity-preview]::after {
+            content:attr(data-quantity-preview); position:absolute; inset:0; z-index:1; pointer-events:none;
+            display:flex; align-items:center; padding-inline:12px; overflow:hidden; white-space:nowrap;
+            border:1px solid #87a7c8; border-radius:7px; background:#eef5fc; color:#143b60;
+            font-weight:700; font-variant-numeric:tabular-nums;
+          }
           .pbful-overlay .pbful-product-search{position:relative;z-index:12;flex:1 0 100%;min-width:0}
           .pbful-overlay .pbful-product-search>slot[name="pbful-product-input"]{display:block;width:100%;min-width:0}
           .pbful-overlay .pbful-product-search>slot[name="pbful-product-input"]::slotted(#pbful-code){width:100%;min-width:0!important}
@@ -11782,27 +12388,21 @@ async function fulfillmentPay() {
           @media(hover:hover){.pbful-overlay[data-theme="playbox"] .pbful-row:hover,.pbful-overlay[data-theme="playbox"] .pbful-line:hover{transform:translateY(-1px);box-shadow:0 6px 16px #2d242a17}.pbful-overlay[data-theme="apple"] .pbful-row:hover,.pbful-overlay[data-theme="apple"] .pbful-line:hover{transform:translateY(-2px);box-shadow:0 7px 18px #00000015}.pbful-overlay[data-theme="md3"] .pbful-row:hover,.pbful-overlay[data-theme="md3"] .pbful-line:hover{transform:translateY(-1px);box-shadow:0 5px 13px #6750a420}.pbful-overlay[data-theme="glass"] .pbful-row:hover,.pbful-overlay[data-theme="glass"] .pbful-line:hover{transform:translateY(-2px);box-shadow:inset 0 1px 0 #fff,0 9px 22px #3f58752a}.pbful-overlay[data-theme="liquid"] .pbful-row:hover,.pbful-overlay[data-theme="liquid"] .pbful-line:hover{transform:translateY(-2px) scale(1.003);box-shadow:inset 0 1px 0 #fff,0 11px 26px #1b5b9128}.pbful-overlay[data-theme="brutal"] .pbful-row:hover,.pbful-overlay[data-theme="brutal"] .pbful-line:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 #111}}
 
           /* Playbox Modern: compact slide and crisp accent confirmation. */
-          .pbful-overlay.open[data-theme="playbox"] .pbful-modal{animation:pbful-enter-playbox 180ms cubic-bezier(.2,.8,.2,1) both}.pbful-overlay[data-theme="playbox"] .pbful-view-enter{animation:pbful-view-playbox 160ms ease-out both}.pbful-overlay[data-theme="playbox"] .pbful-sync.syncing i{animation:pbful-sync-playbox 900ms ease-in-out infinite}.pbful-overlay[data-theme="playbox"] .pbful-line.scan-hit{animation:pbful-hit-playbox 340ms ease-out}.pbful-overlay[data-theme="playbox"] #pbful-toast.show{animation:pbful-toast-playbox 170ms ease-out both}
           @keyframes pbful-enter-playbox{from{opacity:0;transform:translateX(14px)}to{opacity:1;transform:translateX(0)}}@keyframes pbful-view-playbox{from{opacity:.65;transform:translateX(7px)}to{opacity:1;transform:none}}@keyframes pbful-sync-playbox{50%{opacity:.35;transform:scale(.82)}}@keyframes pbful-hit-playbox{0%{box-shadow:0 0 0 0 #7b506f99}45%{box-shadow:0 0 0 4px #7b506f55}100%{box-shadow:0 0 0 0 #7b506f00}}@keyframes pbful-toast-playbox{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 
           /* Apple: quiet scale/fade with soft physical press response. */
-          .pbful-overlay.open[data-theme="apple"] .pbful-modal{animation:pbful-enter-apple 230ms cubic-bezier(.22,1,.36,1) both}.pbful-overlay[data-theme="apple"] .pbful-view-enter{animation:pbful-view-apple 190ms cubic-bezier(.22,1,.36,1) both}.pbful-overlay[data-theme="apple"] button:active:not(:disabled){transform:scale(.965)}.pbful-overlay[data-theme="apple"] .pbful-sync.syncing i{animation:pbful-sync-apple 1.05s ease-in-out infinite}.pbful-overlay[data-theme="apple"] .pbful-line.scan-hit{animation:pbful-hit-apple 380ms ease-out}.pbful-overlay[data-theme="apple"] #pbful-toast.show{animation:pbful-toast-apple 210ms cubic-bezier(.22,1,.36,1) both}
           @keyframes pbful-enter-apple{from{opacity:0;transform:translateY(8px) scale(.985)}to{opacity:1;transform:none}}@keyframes pbful-view-apple{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}@keyframes pbful-sync-apple{50%{opacity:.28;transform:scale(.7)}}@keyframes pbful-hit-apple{0%{box-shadow:0 0 0 0 #0071e399}50%{box-shadow:0 0 0 4px #0071e340}100%{box-shadow:0 0 0 0 #0071e300}}@keyframes pbful-toast-apple{from{opacity:0;transform:translateY(9px) scale(.97)}to{opacity:1;transform:none}}
 
           /* Material 3: emphasized easing and tonal state layers. */
-          .pbful-overlay.open[data-theme="md3"] .pbful-modal{animation:pbful-enter-md3 240ms cubic-bezier(.2,0,0,1) both}.pbful-overlay[data-theme="md3"] .pbful-view-enter{animation:pbful-view-md3 210ms cubic-bezier(.2,0,0,1) both}.pbful-overlay[data-theme="md3"] button{position:relative;isolation:isolate;overflow:hidden}.pbful-overlay[data-theme="md3"] button::after{position:absolute;inset:0;content:"";pointer-events:none;border-radius:inherit;background:currentColor;opacity:0;transform:scale(.82);transition:opacity 120ms cubic-bezier(.2,0,0,1),transform 180ms cubic-bezier(.2,0,0,1)}.pbful-overlay[data-theme="md3"] button:hover::after{opacity:.06;transform:scale(1)}.pbful-overlay[data-theme="md3"] button:active::after{opacity:.12;transform:scale(1)}.pbful-overlay[data-theme="md3"] .pbful-sync.syncing i{animation:pbful-sync-md3 900ms cubic-bezier(.2,0,0,1) infinite}.pbful-overlay[data-theme="md3"] .pbful-line.scan-hit{animation:pbful-hit-md3 360ms cubic-bezier(.2,0,0,1)}.pbful-overlay[data-theme="md3"] #pbful-toast.show{animation:pbful-toast-md3 220ms cubic-bezier(.2,0,0,1) both}
           @keyframes pbful-enter-md3{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:none}}@keyframes pbful-view-md3{from{opacity:.4;transform:scale(.985)}to{opacity:1;transform:none}}@keyframes pbful-sync-md3{0%,100%{transform:scale(.75);opacity:.45}50%{transform:scale(1.2);opacity:1}}@keyframes pbful-hit-md3{0%{box-shadow:0 0 0 0 #6750a499}55%{box-shadow:0 0 0 5px #6750a433}100%{box-shadow:0 0 0 0 #6750a400}}@keyframes pbful-toast-md3{from{opacity:0;transform:translateY(12px) scale(.96)}to{opacity:1;transform:none}}
 
           /* Glassmorphism: one-pass light sweep, no animated backdrop blur. */
-          .pbful-overlay.open[data-theme="glass"] .pbful-modal{animation:pbful-enter-glass 240ms ease-out both}.pbful-overlay.open[data-theme="glass"] .pbful-modal::after{position:absolute;inset:0 0 auto 0;z-index:20;height:82px;content:"";pointer-events:none;background:linear-gradient(105deg,transparent 20%,#ffffff5e 48%,transparent 72%);transform:translateX(-130%);animation:pbful-sheen-glass 620ms 80ms ease-out both}.pbful-overlay[data-theme="glass"] .pbful-view-enter{animation:pbful-view-glass 190ms ease-out both}.pbful-overlay[data-theme="glass"] .pbful-sync.syncing i{animation:pbful-sync-glass 1.1s ease-in-out infinite}.pbful-overlay[data-theme="glass"] .pbful-line.scan-hit{animation:pbful-hit-glass 390ms ease-out}.pbful-overlay[data-theme="glass"] #pbful-toast.show{animation:pbful-toast-glass 220ms ease-out both}
           @keyframes pbful-enter-glass{from{opacity:0;transform:translateX(10px) scale(.99)}to{opacity:1;transform:none}}@keyframes pbful-sheen-glass{to{transform:translateX(130%)}}@keyframes pbful-view-glass{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}@keyframes pbful-sync-glass{50%{opacity:.35;box-shadow:0 0 0 4px #ffffff2e}}@keyframes pbful-hit-glass{0%{box-shadow:inset 0 0 0 0 #5269d800}45%{box-shadow:inset 0 0 0 3px #5269d87a,0 8px 20px #3f587522}100%{box-shadow:inset 0 0 0 0 #5269d800}}@keyframes pbful-toast-glass{from{opacity:0;transform:translateY(10px);filter:blur(3px)}to{opacity:1;transform:none;filter:blur(0)}}
 
           /* Liquid Glass: restrained lensing and luminous one-pass highlight. */
-          .pbful-overlay.open[data-theme="liquid"] .pbful-modal{animation:pbful-enter-liquid 280ms cubic-bezier(.16,1,.3,1) both}.pbful-overlay.open[data-theme="liquid"] .pbful-modal::after{position:absolute;inset:0 0 auto 0;z-index:20;height:96px;content:"";pointer-events:none;background:linear-gradient(110deg,transparent 16%,#ffffff88 43%,#bde7ff4d 52%,transparent 76%);transform:translateX(-135%) skewX(-8deg);animation:pbful-sheen-liquid 760ms 90ms cubic-bezier(.16,1,.3,1) both}.pbful-overlay[data-theme="liquid"] .pbful-view-enter{animation:pbful-view-liquid 220ms cubic-bezier(.16,1,.3,1) both}.pbful-overlay[data-theme="liquid"] button{position:relative;isolation:isolate;overflow:hidden}.pbful-overlay[data-theme="liquid"] button::before{position:absolute;inset:-60%;content:"";pointer-events:none;background:radial-gradient(circle,#ffffff9c 0,transparent 56%);opacity:0;transform:translate(-22%,18%) scale(.55);transition:opacity 150ms ease,transform 220ms cubic-bezier(.16,1,.3,1)}.pbful-overlay[data-theme="liquid"] button:hover::before{opacity:.46;transform:translate(15%,-8%) scale(1)}.pbful-overlay[data-theme="liquid"] button:active::before{opacity:.7;transform:translate(0,0) scale(.8)}.pbful-overlay[data-theme="liquid"] .pbful-sync.syncing i{animation:pbful-sync-liquid 1.1s ease-in-out infinite}.pbful-overlay[data-theme="liquid"] .pbful-line.scan-hit{animation:pbful-hit-liquid 420ms ease-out}.pbful-overlay[data-theme="liquid"] #pbful-toast.show{animation:pbful-toast-liquid 250ms cubic-bezier(.16,1,.3,1) both}
           @keyframes pbful-enter-liquid{0%{opacity:0;transform:translateY(10px) scale(.975)}70%{opacity:1;transform:translateY(-1px) scale(1.003)}100%{transform:none}}@keyframes pbful-sheen-liquid{to{transform:translateX(135%) skewX(-8deg)}}@keyframes pbful-view-liquid{from{opacity:0;transform:translateY(7px) scale(.99)}to{opacity:1;transform:none}}@keyframes pbful-sync-liquid{50%{opacity:.4;box-shadow:0 0 0 5px #72cfff30,0 0 8px #72cfff85}}@keyframes pbful-hit-liquid{0%{box-shadow:inset 0 0 0 0 #1477e300}48%{box-shadow:inset 0 0 0 3px #ffffffd4,0 0 0 5px #1477e338,0 8px 22px #1477e32a}100%{box-shadow:inset 0 0 0 0 #1477e300,0 0 0 0 #1477e300}}@keyframes pbful-toast-liquid{from{opacity:0;transform:translateY(12px) scale(.94);filter:blur(4px)}to{opacity:1;transform:none;filter:blur(0)}}
 
           /* Brutalism: hard snap, stepped status and physical offset shadows. */
-          .pbful-overlay.open[data-theme="brutal"] .pbful-modal{animation:pbful-enter-brutal 130ms steps(2,end) both}.pbful-overlay[data-theme="brutal"] .pbful-view-enter{animation:pbful-view-brutal 110ms steps(2,end) both}.pbful-overlay[data-theme="brutal"] button{transition:transform 80ms steps(1,end),box-shadow 80ms steps(1,end),background-color 80ms steps(1,end)}.pbful-overlay[data-theme="brutal"] button:hover:not(:disabled){transform:translate(-1px,-1px);box-shadow:3px 3px 0 #111}.pbful-overlay[data-theme="brutal"] button:active:not(:disabled){transform:translate(2px,2px);box-shadow:0 0 0 #111}.pbful-overlay[data-theme="brutal"] .pbful-sync.syncing i{animation:pbful-sync-brutal 700ms steps(1,end) infinite}.pbful-overlay[data-theme="brutal"] .pbful-line.scan-hit{animation:pbful-hit-brutal 300ms steps(2,end)}.pbful-overlay[data-theme="brutal"] #pbful-toast.show{animation:pbful-toast-brutal 120ms steps(2,end) both}
           @keyframes pbful-enter-brutal{from{opacity:0;transform:translate(8px,8px)}to{opacity:1;transform:none}}@keyframes pbful-view-brutal{from{opacity:.3;transform:translateX(6px)}to{opacity:1;transform:none}}@keyframes pbful-sync-brutal{50%{opacity:.15}}@keyframes pbful-hit-brutal{0%,100%{outline:0 solid #ffdf3e}50%{outline:4px solid #ffdf3e;outline-offset:-4px}}@keyframes pbful-toast-brutal{from{opacity:0;transform:translate(6px,6px)}to{opacity:1;transform:none}}
 
           @media(prefers-reduced-motion:reduce){.pbful-overlay .pbful-modal,.pbful-overlay .pbful-view-enter,.pbful-overlay .pbful-line.scan-hit,.pbful-overlay .pbful-sync.syncing i,.pbful-overlay #pbful-toast.show,.pbful-overlay .pbful-modal::after{animation:none!important}.pbful-overlay button,.pbful-overlay button::before,.pbful-overlay button::after,.pbful-overlay .pbful-row,.pbful-overlay .pbful-line,.pbful-overlay .pbful-resize-handle{transition:none!important}.pbful-overlay button:active,.pbful-overlay .pbful-row:hover,.pbful-overlay .pbful-line:hover,.pbful-overlay .pbful-resize-handle:hover{transform:none!important}}
@@ -12224,8 +12824,8 @@ async function fulfillmentPay() {
         if(fresh.legacyPendingCount)throw reviewError('LEGACY_REVIEW_PENDING','旧补开仍有待上传数据，请先同步，未建立新记录。','Sincronice primero los pendientes de la revisión anterior.');
         const operation=reviewOperation(detail.picking.id);
         const domain=[['x_pb_operation','=',operation],['x_name','=',String(op.id)]];
-        const existing=await searchRead(SHARED_EVENT_MODEL,domain,['id','x_name'],{limit:1});
-        if(existing.length)return {...existing[0],duplicate:true};
+        const existing=await searchRead(SHARED_EVENT_MODEL,domain,['id','x_name','x_pb_payload'],{limit:1});
+        if(existing.length)return verifyExistingOperation(existing[0],op);
         const values=eventValuesForOperation(op,detail,session);
         values.x_pb_picking_id=false;values.x_pb_request_id=false;values.x_pb_move_id=false;
         values.x_pb_operation=operation;values.x_pb_source='postpaid_review';
@@ -12233,7 +12833,7 @@ async function fulfillmentPay() {
         values.x_pb_payload=JSON.stringify({...payload,reviewBaseline:detail.reviewBaseline,nativePickingId:detail.nativePicking.id,
             ...(fresh.legacyReview ? {legacyReviewRevision:fresh.legacyReview.revision} : {})});
         try {const id=await rpc(SHARED_EVENT_MODEL,'create',[values]);return {id,...values};}
-        catch(error){const saved=await searchRead(SHARED_EVENT_MODEL,domain,['id','x_name'],{limit:1});if(saved.length)return saved[0];throw error;}
+        catch(error){const saved=await searchRead(SHARED_EVENT_MODEL,domain,['id','x_name','x_pb_payload'],{limit:1});if(saved.length)return verifyExistingOperation(saved[0],op);throw error;}
     }
     async function syncReviewState(options={}) {
         const prior=state.detail, token=state.session?.token;
@@ -12312,8 +12912,11 @@ async function fulfillmentPay() {
     const postPaidFeature=new PostpaidNavigationService(state,{canLeaveDetail,invalidateDashboardIndex,render,refresh});
     function boot() {
         if (!document.body) return setTimeout(boot, 50);
-        PAGE_WINDOW.addEventListener('pointerdown',primeScanErrorAudio,{once:true,capture:true});
-        PAGE_WINDOW.addEventListener('keydown',primeScanErrorAudio,{once:true,capture:true});
+        const unlockScanSound = () => {
+            if (state.open && state.view === 'detail' && (!scanErrorBufferPromise || scanErrorAudio?.state !== 'running')) primeScanErrorAudio();
+        };
+        PAGE_WINDOW.addEventListener('pointerdown',unlockScanSound,true);
+        PAGE_WINDOW.addEventListener('keydown',unlockScanSound,true);
         hydrateBoxMappings();
         installPrepickCancelRecovery();
         installCompactUi();

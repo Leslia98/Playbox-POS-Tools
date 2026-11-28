@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playbox Odoo - 配货中心 测试库专用
 // @namespace    https://pb-11-23.odoo.com/playbox-suite/qa
-// @version      1.2.18.10
+// @version      1.2.18.11
 // @description  平板横屏单行整表；付款后补开配货；已出库仅扫码核对，不重复扣库存。保留扫码提速、F3/F4及原配货流程。
 // @author       Playbox
 // @run-at       document-start
@@ -23,8 +23,8 @@ if (window.top !== window.self || location.origin !== "https://pb-11-23.odoo.com
 function startFulfillment() {
 const PBFUL_ENTRY_MARKER = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "data-pb-suite-fulfillment-pos" : "data-pb-suite-fulfillment-workspace";
 if (document.documentElement?.hasAttribute(PBFUL_ENTRY_MARKER)) return;
-document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.10");
-document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.10");
+document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.11");
+document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.11");
 
 
 
@@ -1257,7 +1257,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
 
 (function () {
 const PBFUL_MODE = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "desktop" : "workspace";
-const PBFUL_VERSION = "1.2.18.10";
+const PBFUL_VERSION = "1.2.18.11";
 
 (function () {
     "use strict";
@@ -4425,14 +4425,17 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
     // bridge status publication; this reader never writes an Odoo record.
     async function readDeliveryTaskSnapshot(row,readOptions) {
         const pf = state.fieldMap;
-        const picking = await readOne("stock.picking", row.picking.id, [
+        const readPicking = () => readOne("stock.picking", row.picking.id, [
             "id", "name", "state", "backorder_id", "scheduled_date", "date_done", "partner_id", "pos_order_id", "picking_type_id", "location_id", "move_ids", "write_date", "user_id", ...(isSale(row) ? ["sale_id", "picking_type_code"] : []),
             ...Object.values(pf).filter((v) => typeof v === "string"),
         ],readOptions);
-        if (!picking) throw new Error(state.lang === "es" ? "La entrega ya no existe o no está disponible" : "交货单已不存在或无法访问");
-        let moves = await readAll("stock.move", [["picking_id", "=", picking.id], ...(isSale(row) && picking.state === "cancel" ? [] : [["state", "!=", "cancel"]])], [
+        const readMoves = includeCancelled => readAll("stock.move", [["picking_id", "=", row.picking.id], ...(includeCancelled ? [] : [["state", "!=", "cancel"]])], [
             "id", "picking_id", "product_id", "product_uom_qty", "quantity", "product_uom", "has_tracking", "picked", "state", "write_date", "company_id", "location_id", "location_dest_id", ...(isSale(row) ? ["sale_line_id"] : []),
         ], 1000,readOptions);
+        const saleTask = isSale(row);
+        const [picking, posMoves] = await Promise.all([readPicking(), saleTask ? null : readMoves(false)]);
+        if (!picking) throw new Error(state.lang === "es" ? "La entrega ya no existe o no está disponible" : "交货单已不存在或无法访问");
+        let moves = saleTask ? await readMoves(picking.state === "cancel") : posMoves;
         if (isSale(row)) {
             if (m2oId(picking.sale_id) !== row.order.id || m2oId(picking.pos_order_id) || picking.picking_type_code !== "outgoing")
                 throw new Error(t("saleNoDelivery"));
@@ -12858,14 +12861,18 @@ async function fulfillmentPay() {
     }
     async function readReviewTaskDetail(row, options={}) {
         const nativeId = reviewNativeId(row.picking.id);
-        const policy = await readReviewPolicyData(row,nativeId,options.readOptions);
-        row={...row,order:{...row.order,...policy.order}};
         const nativeRow = {...row, review:false, key:deliveryTaskKey('order',nativeId,row.order.id),
             picking:{...row.picking,id:nativeId}};
         // Only catalog rows are reused for 15 seconds. Native picking/moves,
         // payment/refund/return policy and both review logs are always reread.
         const catalog=options.catalog?.review?{...options.catalog,picking:options.catalog.nativePicking}:options.catalog;
-        const snapshot = await readDeliveryTaskSnapshot(nativeRow,options.readOptions);
+        // Both reads address the same native IDs. Require both results before replay or use.
+        const [policy, snapshot] = await Promise.all([
+            readReviewPolicyData(row, nativeId, options.readOptions),
+            readDeliveryTaskSnapshot(nativeRow, options.readOptions),
+        ]);
+        row = {...row, order:{...row.order, ...policy.order}};
+        snapshot.row = {...nativeRow, order:row.order};
         if (snapshot.picking.state !== 'done' || !posPaymentConfirmed(row.order)) throw new Error('REVIEW_DELIVERY_CHANGED');
         const nativeMoves = snapshot.moves.filter(m => m.state === 'done' && Number(m.quantity)>0);
         if (!nativeMoves.length) throw new Error(state.lang==='es'?'No hay mercancía entregada para revisar.':'没有实际出库商品可供补开核对。');

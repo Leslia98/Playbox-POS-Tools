@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playbox Odoo - 配货中心 正式版
 // @namespace    https://playboxelectronics1.odoo.com/playbox-suite
-// @version      1.2.18.11
+// @version      1.2.18.12
 // @description  平板横屏单行整表；付款后补开配货；已出库仅扫码核对，不重复扣库存。保留扫码提速、F3/F4及原配货流程。
 // @author       Playbox
 // @run-at       document-start
@@ -23,8 +23,8 @@ if (window.top !== window.self || location.protocol !== "https:" ||
 function startFulfillment() {
 const PBFUL_ENTRY_MARKER = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "data-pb-suite-fulfillment-pos" : "data-pb-suite-fulfillment-workspace";
 if (document.documentElement?.hasAttribute(PBFUL_ENTRY_MARKER)) return;
-document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.11");
-document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.11");
+document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.12");
+document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.12");
 
 
 
@@ -1257,7 +1257,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
 
 (function () {
 const PBFUL_MODE = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "desktop" : "workspace";
-const PBFUL_VERSION = "1.2.18.11";
+const PBFUL_VERSION = "1.2.18.12";
 
 (function () {
     "use strict";
@@ -2222,14 +2222,16 @@ function normalizeDashboardPreferences(record) {
             throw reviewError('COMPANY_REVIEW','订单与交货单公司不一致，请核对原单。','No coincide la compañía del pedido y la entrega.');
         return picking;
     }
-    async function readReviewPolicyData(row, nativeId,readOptions) {
-        const order = await readOne('pos.order', Number(row.order.id), ['id','uuid','name','pos_reference','state','company_id','picking_ids','is_refund'],readOptions);
+    async function readReviewPolicyData(order, nativeId, readOptions) {
         if (!order || !posPaymentConfirmed(order)) throw reviewError('PAYMENT_UNCONFIRMED','服务器尚未确认付款，未继续补开。','El servidor no confirma el pago.');
-        const [lines, pickings] = await Promise.all([
+        const ids = (order.picking_ids || []).map(m2oId);
+        const [lines, pickings, candidates] = await Promise.all([
             readAll('pos.order.line', [['order_id','=',order.id]], ['id','product_id','qty','refunded_qty','refunded_orderline_id','refund_orderline_ids'], 1000,readOptions),
-            readAll('stock.picking', ['|',['pos_order_id','=',order.id],['id','in',(order.picking_ids || []).map(m2oId)]], ['id','name','state','picking_type_code','pos_order_id','company_id'], 1000,readOptions),
+            readAll('stock.picking', ['|',['pos_order_id','=',order.id],['id','in',ids]], ['id','name','state','picking_type_code','pos_order_id','company_id'], 1000,readOptions),
+            readAll('stock.picking', [['state','!=','cancel'], '|', ['return_id.pos_order_id','=',order.id], ['return_id','in',ids]], ['id','return_id'], 1000,readOptions),
         ]);
-        const returns = pickings.length ? await searchRead('stock.picking', [['return_id','in',pickings.map(p=>p.id)],['state','!=','cancel']], ['id'], {limit:1},readOptions) : [];
+        const visible = new Set(pickings.map(picking => picking.id));
+        const returns = candidates.filter(picking => visible.has(m2oId(picking.return_id)));
         const data = {order, lines, pickings, returns};
         assertReviewPolicy(data, nativeId);
         return data;
@@ -2595,8 +2597,16 @@ function legacyReviewReplay(events, snapshot) {
         if(verified?.action!==action)throw new Error('TASK_MEMBERSHIP_RESULT_UNCONFIRMED');
         state.taskMembership ||= new Map();state.taskMembership.set(row.key,verified);invalidateDashboardIndex();return verified;
     }
-    async function readWithdrawalState(row) {
-        if (row.review) return readReviewTaskDetail(row, {membershipOnly:true});
+    function taskTiming(action) {
+        if (location.hostname !== 'pb-11-23.odoo.com' || !new URLSearchParams(location.search).has('pbfulTiming')) return;
+        const start = performance.now(), marks = {};
+        return step => {
+            marks[step] = Math.round(performance.now() - start);
+            document.documentElement.dataset.pbfulTiming = JSON.stringify({action, marks});
+        };
+    }
+    async function readWithdrawalState(row, timing) {
+        if (row.review) return readReviewTaskDetail(row, {membershipOnly:true, timing});
         const snapshot = await readDeliveryTaskSnapshot(row);
         return {...snapshot, sharedEventCount:snapshot.sharedEvents.length};
     }
@@ -2617,20 +2627,30 @@ function legacyReviewReplay(events, snapshot) {
         const row=state.rows.find(r=>r.key===key);
         if(!row||!row.review&&!isSale(row))throw new Error('TASK_WITHDRAWAL_NOT_SUPPORTED');
         assertNoTaskPending(row);
-        const prior=await latestTaskMembership(key);
+        const timing = taskTiming('withdraw');
+        const [priorResult, detailResult] = await Promise.allSettled([
+            latestTaskMembership(key).then(value => { timing?.('membership'); return value; }),
+            readWithdrawalState(row, timing),
+        ]);
+        if (priorResult.status === 'rejected') throw priorResult.reason;
+        const prior = priorResult.value;
         if(prior?.action==='withdraw'){invalidateDashboardIndex();showVerifiedWithdrawal(row,prior);return;}
-        const detail=await readWithdrawalState(row);
+        if (detailResult.status === 'rejected') throw detailResult.reason;
+        const detail = detailResult.value;
         if(isReadOnlyDetail(detail)||detail.tech.validation)throw new Error(pbUiText('任务已完成或正在验收，不能移出待办。','La tarea está terminada o validándose.'));
         const baseline=taskMembershipFingerprint(detail),es=state.lang==='es';
         const p=Core.progress(detail.tech,detail.moves);
+        timing?.('confirm ready');
         await showPrompt(`${row.order.pos_reference||row.order.name}\n${detail.nativePicking?.name||detail.picking.name}\n${statusLabel(row.status)} · ${p.scanned}/${p.demand}\n`+(es?'¿Retirar solo esta tarea? Se conservan pedido, pago, entrega, inventario y escaneos. Puede restaurarla desde el historial.':'确认仅移出这次配货任务？原订单、付款、交货、库存和扫码记录全部保留，可在“已移出任务”恢复。'),'confirm',{
             title:es?'Retirar tarea':'移出配货待办',keepOpenOnError:true,actions:[{label:es?'Volver':'返回',value:false},{label:es?'Confirmar retiro':'确认移出',primary:true,waitForAction:true,onClick:()=>withDeviceMutationLock(row.picking.id,async()=>{
                 assertNoTaskPending(row);
-                const fresh=await readWithdrawalState(row);
+                const commitTiming = taskTiming('confirm withdrawal');
+                const fresh=await readWithdrawalState(row, commitTiming);
                 assertNoTaskPending(row);
                 if(isReadOnlyDetail(fresh)||fresh.tech.validation||taskMembershipFingerprint(fresh)!==baseline)throw new Error(pbUiText('另一端的扫码或状态已变化，请返回重新核对后再移出。','Cambió el escaneo o estado; vuelva a revisar.'));
                 const verified = await appendTaskMembership(row,'withdraw',fresh,prior?.eventId);
                 showVerifiedWithdrawal(row,verified);
+                commitTiming?.('withdrawn');
                 return true;
             })}]
         });
@@ -4533,9 +4553,12 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
     // Existing callers keep their behavior and side-effect order. Use
     // readTaskDetail for a query that must not publish a bridge status.
     async function loadDetail(row, options = {}) {
-        await assertTaskListed(row,options.readOptions);
         const {type} = taskIdentity(row);
-        if (type === 'review') return loadReviewDetail(row, options);
+        if (type === 'review') {
+            const [, detail] = await Promise.all([assertTaskListed(row, options.readOptions), loadReviewDetail(row, options)]);
+            return detail;
+        }
+        await assertTaskListed(row,options.readOptions);
         if (type === 'prepick') return loadPrepickDetail(row);
         const snapshot = await readDeliveryTaskSnapshot(row,options.readOptions);
         throwIfReadCancelled(options.readOptions);
@@ -9047,6 +9070,7 @@ function inspectOfflineQueue(storage, baseKey) {
         if(!state.dashboardRefreshing)state.loading=false;
     }
     async function openOrder(orderKey) {
+        const timing = taskTiming('scan');
         const row = state.rows.find((item) => String(item.key || `o:${item.order.id}`) === String(orderKey) || (!String(orderKey).includes(":") && Number(item.order.id) === Number(orderKey)));
         if (!row?.picking || state.detailRequest || state.loading&&!state.dashboardRefreshing) return;
         cancelDashboardRead();
@@ -9066,8 +9090,9 @@ function inspectOfflineQueue(storage, baseKey) {
         try {
             // Notes update their own label. Only the barcode map and task data gate scanning.
             void refreshOrderNotes([row],request).catch(() => {});
-            let [boxSync, initialDetail] = await Promise.all([ensureBoxMappingsFresh(), loadDetail(row,{readOptions:request})]);
+            let [boxSync, initialDetail] = await Promise.all([ensureBoxMappingsFresh(), loadDetail(row,{readOptions:request, timing})]);
             if(!current())return false;
+            timing?.('task and barcode map');
             if (initialDetail?.review && initialDetail.legacyPendingCount) initialDetail = await resumeLegacyReviewPending(initialDetail);
             if(!current())return false;
             if (!boxSync.ok) toast(`${t("boxSyncFallback")} ${boxSync.count}：${boxSync.error}`, "warn", 5000);
@@ -9082,10 +9107,11 @@ function inspectOfflineQueue(storage, baseKey) {
             if (isReadOnlyDetail()) enterReadOnlyDetail(state.detail);
             state.pickerEditing=false;
             await ensureRememberedPickerSession();
+            timing?.('picker session');
             state.messageDrawerOpen=false;state.messageDrawerDismissed=false;state.messagePaneTyped=false;
             opened = true;
         } catch (error) { if(current())toast(error.message, "error", 6000); }
-        finally { if(state.detailRequest===request){state.detailRequest=null;state.loading=false;render();if(opened)focusScan(true);} }
+        finally { if(state.detailRequest===request){state.detailRequest=null;state.loading=false;render();if(opened){focusScan(true);timing?.('scan form ready');}} }
         if (opened && !isReadOnlyDetail() && offlineQueue().some((item) => Number(item.pickingId) === Number(state.detail?.picking?.id))) await flushOffline();
         return opened;
     }
@@ -12866,22 +12892,33 @@ async function fulfillmentPay() {
         // Only catalog rows are reused for 15 seconds. Native picking/moves,
         // payment/refund/return policy and both review logs are always reread.
         const catalog=options.catalog?.review?{...options.catalog,picking:options.catalog.nativePicking}:options.catalog;
-        // Both reads address the same native IDs. Require both results before replay or use.
-        const [policy, snapshot] = await Promise.all([
-            readReviewPolicyData(row, nativeId, options.readOptions),
-            readDeliveryTaskSnapshot(nativeRow, options.readOptions),
+        const reads = options.readOptions;
+        const timing = options.timing;
+        const orderRead = readOne('pos.order', Number(row.order.id),
+            ['id','uuid','name','pos_reference','state','company_id','picking_ids','is_refund'], reads);
+        const deliveryRead = readDeliveryTaskSnapshot(nativeRow, reads).then(snapshot => {
+            timing?.('delivery');
+            if (snapshot.picking.state !== 'done') throw new Error('REVIEW_DELIVERY_CHANGED');
+            return options.membershipOnly ? snapshot : readDeliveryTaskCatalog(snapshot, {...options, catalog, reviewCatalog:true});
+        });
+        const [policy, detail, logs] = await Promise.all([
+            orderRead.then(order => readReviewPolicyData(order, nativeId, reads)).then(policy => { timing?.('payment/refunds/returns'); return policy; }),
+            deliveryRead.then(detail => { timing?.('delivery + catalog'); return detail; }),
+            orderRead.then(async order => {
+                if (!order?.uuid || !m2oId(order.company_id)) return [];
+                const operations = [reviewOperation(row.picking.id), legacyReviewOperation(order)];
+                const records = await readAll(SHARED_EVENT_MODEL, [['x_pb_operation','in',operations]],
+                    ['id','x_name','x_pb_operation','x_pb_payload','x_pb_status','x_pb_picker','x_pb_device_id','x_pb_client_time'], 1000,reads);
+                timing?.('review history');
+                return records;
+            }),
         ]);
         row = {...row, order:{...row.order, ...policy.order}};
-        snapshot.row = {...nativeRow, order:row.order};
-        if (snapshot.picking.state !== 'done' || !posPaymentConfirmed(row.order)) throw new Error('REVIEW_DELIVERY_CHANGED');
-        const nativeMoves = snapshot.moves.filter(m => m.state === 'done' && Number(m.quantity)>0);
+        const nativeMoves = detail.moves.filter(m => m.state === 'done' && Number(m.quantity)>0);
         if (!nativeMoves.length) throw new Error(state.lang==='es'?'No hay mercancía entregada para revisar.':'没有实际出库商品可供补开核对。');
         if (nativeMoves.some(m => !Number.isSafeInteger(Number(m.quantity)))) throw new Error('REVIEW_INVALID_QUANTITY');
-        const [events, legacyEvents, detail] = await Promise.all([
-            readReviewEvents(row.picking.id, options.readOptions),
-            readLegacyReviewEvents(row.order, options.readOptions),
-            options.membershipOnly ? snapshot : readDeliveryTaskCatalog(snapshot, {...options, catalog, reviewCatalog:true}),
-        ]);
+        const events = logs.filter(event => event.x_pb_operation === reviewOperation(row.picking.id));
+        const legacyEvents = logs.filter(event => event.x_pb_operation === legacyReviewOperation(row.order));
         if(legacyEvents.length && policy.pickings.filter(p=>p.state!=='cancel'&&p.picking_type_code==='outgoing').length!==1)throw reviewError('LEGACY_REVIEW_SPLIT','旧补开对应多张交货单，数据已保留，请核对关联，未自动分配。','La revisión anterior tiene varias entregas. Revise el vínculo; no se repartieron cantidades.');
         const revision=await legacyReviewRevision(legacyEvents);
         const {moves,fingerprint,tech,legacyReview}=reviewSnapshot(nativeId,row.order.id,nativeMoves,events,{order:row.order,events:legacyEvents,revision});

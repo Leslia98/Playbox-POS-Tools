@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Playbox Odoo - 配货中心 测试库专用
 // @namespace    https://pb-11-23.odoo.com/playbox-suite/qa
-// @version      1.2.18.12
+// @version      1.2.18.13
 // @description  平板横屏单行整表；付款后补开配货；已出库仅扫码核对，不重复扣库存。保留扫码提速、F3/F4及原配货流程。
 // @author       Playbox
 // @run-at       document-start
@@ -23,8 +23,8 @@ if (window.top !== window.self || location.origin !== "https://pb-11-23.odoo.com
 function startFulfillment() {
 const PBFUL_ENTRY_MARKER = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "data-pb-suite-fulfillment-pos" : "data-pb-suite-fulfillment-workspace";
 if (document.documentElement?.hasAttribute(PBFUL_ENTRY_MARKER)) return;
-document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.12");
-document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.12");
+document.documentElement?.setAttribute(PBFUL_ENTRY_MARKER,"1.2.18.13");
+document.documentElement?.setAttribute("data-pbful-installation","unified:1.2.18.13");
 
 
 
@@ -1257,7 +1257,7 @@ if(document.body)pbEnsureLanguageEntry();else document.addEventListener("DOMCont
 
 (function () {
 const PBFUL_MODE = /^\/pos\/ui(?:\/|$)/.test(location.pathname) ? "desktop" : "workspace";
-const PBFUL_VERSION = "1.2.18.12";
+const PBFUL_VERSION = "1.2.18.13";
 
 (function () {
     "use strict";
@@ -2222,16 +2222,24 @@ function normalizeDashboardPreferences(record) {
             throw reviewError('COMPANY_REVIEW','订单与交货单公司不一致，请核对原单。','No coincide la compañía del pedido y la entrega.');
         return picking;
     }
-    async function readReviewPolicyData(order, nativeId, readOptions) {
-        if (!order || !posPaymentConfirmed(order)) throw reviewError('PAYMENT_UNCONFIRMED','服务器尚未确认付款，未继续补开。','El servidor no confirma el pago.');
-        const ids = (order.picking_ids || []).map(m2oId);
-        const [lines, pickings, candidates] = await Promise.all([
-            readAll('pos.order.line', [['order_id','=',order.id]], ['id','product_id','qty','refunded_qty','refunded_orderline_id','refund_orderline_ids'], 1000,readOptions),
-            readAll('stock.picking', ['|',['pos_order_id','=',order.id],['id','in',ids]], ['id','name','state','picking_type_code','pos_order_id','company_id'], 1000,readOptions),
-            readAll('stock.picking', [['state','!=','cancel'], '|', ['return_id.pos_order_id','=',order.id], ['return_id','in',ids]], ['id','return_id'], 1000,readOptions),
+    async function readReviewPolicyData(orderRead, listedOrder, nativeId, readOptions) {
+        const idsOf = order => [...new Set((order.picking_ids || []).map(m2oId).filter(Boolean))].sort((a,b) => a-b);
+        const predicted = idsOf(listedOrder);
+        const readPickings = ids => readAll('stock.picking', ['|',['pos_order_id','=',listedOrder.id],['id','in',ids]],
+            ['id','name','state','picking_type_code','pos_order_id','company_id'], 1000,readOptions);
+        const readReturns = ids => ids.length ? searchRead('stock.picking', [['state','!=','cancel'],['return_id','in',ids]],
+            ['id'], {limit:1}, readOptions) : [];
+        // The list provides a head start only. Reconcile every ID with the live order and its visible pickings.
+        const [order, lines, initialPickings, initialReturns] = await Promise.all([
+            orderRead,
+            readAll('pos.order.line', [['order_id','=',listedOrder.id]], ['id','product_id','qty','refunded_qty','refunded_orderline_id','refund_orderline_ids'], 1000,readOptions),
+            readPickings(predicted), readReturns(predicted),
         ]);
-        const visible = new Set(pickings.map(picking => picking.id));
-        const returns = candidates.filter(picking => visible.has(m2oId(picking.return_id)));
+        if (!order || !posPaymentConfirmed(order)) throw reviewError('PAYMENT_UNCONFIRMED','服务器尚未确认付款，未继续补开。','El servidor no confirma el pago.');
+        const actual = idsOf(order);
+        const pickings = actual.join(',') === predicted.join(',') ? initialPickings : await readPickings(actual);
+        const verifiedIds = pickings.map(p => p.id).sort((a,b) => a-b);
+        const returns = verifiedIds.join(',') === predicted.join(',') ? initialReturns : await readReturns(verifiedIds);
         const data = {order, lines, pickings, returns};
         assertReviewPolicy(data, nativeId);
         return data;
@@ -2598,7 +2606,9 @@ function legacyReviewReplay(events, snapshot) {
         state.taskMembership ||= new Map();state.taskMembership.set(row.key,verified);invalidateDashboardIndex();return verified;
     }
     function taskTiming(action) {
-        if (location.hostname !== 'pb-11-23.odoo.com' || !new URLSearchParams(location.search).has('pbfulTiming')) return;
+        if (location.hostname !== 'pb-11-23.odoo.com') return;
+        const navigation = performance.getEntriesByType('navigation')[0];
+        if (!new URL(navigation?.name || location.href).searchParams.has('pbfulTiming')) return;
         const start = performance.now(), marks = {};
         return step => {
             marks[step] = Math.round(performance.now() - start);
@@ -2640,9 +2650,8 @@ function legacyReviewReplay(events, snapshot) {
         if(isReadOnlyDetail(detail)||detail.tech.validation)throw new Error(pbUiText('任务已完成或正在验收，不能移出待办。','La tarea está terminada o validándose.'));
         const baseline=taskMembershipFingerprint(detail),es=state.lang==='es';
         const p=Core.progress(detail.tech,detail.moves);
-        timing?.('confirm ready');
         await showPrompt(`${row.order.pos_reference||row.order.name}\n${detail.nativePicking?.name||detail.picking.name}\n${statusLabel(row.status)} · ${p.scanned}/${p.demand}\n`+(es?'¿Retirar solo esta tarea? Se conservan pedido, pago, entrega, inventario y escaneos. Puede restaurarla desde el historial.':'确认仅移出这次配货任务？原订单、付款、交货、库存和扫码记录全部保留，可在“已移出任务”恢复。'),'confirm',{
-            title:es?'Retirar tarea':'移出配货待办',keepOpenOnError:true,actions:[{label:es?'Volver':'返回',value:false},{label:es?'Confirmar retiro':'确认移出',primary:true,waitForAction:true,onClick:()=>withDeviceMutationLock(row.picking.id,async()=>{
+            title:es?'Retirar tarea':'移出配货待办',onShown:() => timing?.('confirm ready'),keepOpenOnError:true,actions:[{label:es?'Volver':'返回',value:false},{label:es?'Confirmar retiro':'确认移出',primary:true,waitForAction:true,onClick:()=>withDeviceMutationLock(row.picking.id,async()=>{
                 assertNoTaskPending(row);
                 const commitTiming = taskTiming('confirm withdrawal');
                 const fresh=await readWithdrawalState(row, commitTiming);
@@ -4498,7 +4507,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         const baselineProductIds = isSale(row) ? baselineMoves(tech).map(move => m2oId(move.product_id)) : [];
         const productIds = [...new Set([...orderProductIds, ...extraProductIds, ...baselineProductIds].filter(Boolean))];
         const locationId = m2oId(picking.location_id);
-        const cached = options.catalog;
+        const cached = options.catalog || (options.opening && state.lastOpeningCodes);
         const requestedIds = new Set(productIds.map(Number));
         const recent = cached && Number(cached.picking.id) === Number(picking.id) &&
             m2oId(cached.picking.location_id) === locationId && Date.now() - cached.codesLoadedAt < 15000 &&
@@ -4506,25 +4515,25 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
         const loadedIds = cached?.catalogProductIds;
         const useCatalog = recent && loadedIds?.length === requestedIds.size &&
             loadedIds.every(id => requestedIds.has(id));
-        let products, stock, systemCodes;
-        if (useCatalog) {
-            products = cached.products.filter(p => requestedIds.has(Number(p.id)));
-            stock = cached.stock;
-            systemCodes = cached.systemCodes;
-        } else {
-            const [catalog, quants] = await Promise.all([
-                readScanCatalog(productIds),
-                productIds.length && locationId ? readAll("stock.quant", [
-                    ["product_id", "in", productIds], ["location_id", "child_of", locationId],
-                ], ["id", "product_id", "quantity", "reserved_quantity"], 1000) : [],
-            ]);
-            products = catalog.products;
-            systemCodes = catalog.systemCodes;
-            stock = new Map();
+        const readStock = async () => {
+            const quants = productIds.length && locationId ? await readAll("stock.quant", [
+                ["product_id", "in", productIds], ["location_id", "child_of", locationId],
+            ], ["id", "product_id", "quantity", "reserved_quantity"], 1000, options.readOptions) : [];
+            const result = new Map();
             for (const quant of quants) {
                 const id = m2oId(quant.product_id);
-                stock.set(id, (stock.get(id) || 0) + Number(quant.quantity || 0));
+                result.set(id, (result.get(id) || 0) + Number(quant.quantity || 0));
             }
+            return result;
+        };
+        const [{products, systemCodes}, stock] = await Promise.all([
+            useCatalog ? cached : readScanCatalog(productIds),
+            useCatalog && !options.opening ? cached.stock : readStock(),
+        ]);
+        const codesLoadedAt = useCatalog ? cached.codesLoadedAt : Date.now();
+        if (!useCatalog || options.opening) {
+            state.lastOpeningCodes = {picking:{id:picking.id, location_id:picking.location_id}, products, systemCodes,
+                codesLoadedAt, boxCodesLoadedAt:state.boxLoadedAt, catalogProductIds:products.map(p => Number(p.id))};
         }
         const odooCodeCount = new Set(systemCodes.flatMap((item) => Core.parseCodeList(item.code))).size;
         const boxCodeCount = new Set(state.boxMappings.filter((item) => item.enabled).map((item) => Core.normalizeCode(item.boxCode)).filter(Boolean)).size;
@@ -4535,7 +4544,7 @@ function pbCanUsePosPrepickForRepaidSale({snapshot, saleLines, priorLines, prior
             catalogProductIds: products.map(product => Number(product.id)),
             responsible: effectivePicker(picking, tech),
             index: Core.productCodeIndex(products, state.boxMappings, systemCodes),
-            codesLoadedAt: useCatalog ? cached.codesLoadedAt : Date.now(), odooCodeCount, boxCodeCount, boxCodesLoadedAt: state.boxLoadedAt,
+            codesLoadedAt, odooCodeCount, boxCodeCount, boxCodesLoadedAt: state.boxLoadedAt,
         };
     }
 
@@ -6888,6 +6897,7 @@ function inspectOfflineQueue(storage, baseKey) {
         }, { once: true });
         root.appendChild(dialog);
         dialog.showModal();
+        item.options.onShown?.();
         if (item.options.fitNoteViewport && textInput) fitOrderNoteViewport(dialog, actions, textInput);
         // A scanner's Enter must not accidentally confirm a stock operation.
         (textInput || heading).focus({ preventScroll: true });
@@ -9090,7 +9100,7 @@ function inspectOfflineQueue(storage, baseKey) {
         try {
             // Notes update their own label. Only the barcode map and task data gate scanning.
             void refreshOrderNotes([row],request).catch(() => {});
-            let [boxSync, initialDetail] = await Promise.all([ensureBoxMappingsFresh(), loadDetail(row,{readOptions:request, timing})]);
+            let [boxSync, initialDetail] = await Promise.all([ensureBoxMappingsFresh(), loadDetail(row,{readOptions:request, timing, opening:true})]);
             if(!current())return false;
             timing?.('task and barcode map');
             if (initialDetail?.review && initialDetail.legacyPendingCount) initialDetail = await resumeLegacyReviewPending(initialDetail);
@@ -12902,7 +12912,7 @@ async function fulfillmentPay() {
             return options.membershipOnly ? snapshot : readDeliveryTaskCatalog(snapshot, {...options, catalog, reviewCatalog:true});
         });
         const [policy, detail, logs] = await Promise.all([
-            orderRead.then(order => readReviewPolicyData(order, nativeId, reads)).then(policy => { timing?.('payment/refunds/returns'); return policy; }),
+            readReviewPolicyData(orderRead, row.order, nativeId, reads).then(policy => { timing?.('payment/refunds/returns'); return policy; }),
             deliveryRead.then(detail => { timing?.('delivery + catalog'); return detail; }),
             orderRead.then(async order => {
                 if (!order?.uuid || !m2oId(order.company_id)) return [];

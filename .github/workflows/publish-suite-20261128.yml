@@ -1,0 +1,50 @@
+name: Publish Playbox suite 2026-11-28
+on:
+  push:
+    branches: [publish/suite-2026-11-28]
+    paths: [.github/workflows/publish-suite-20261128.yml]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bd668c55ad1a4496649b90e124da730f83612eba
+          persist-credentials: false
+      - name: Package and verify the 13 enabled userscripts
+        shell: python
+        run: |
+          from pathlib import Path
+          from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
+          files = sorted(p.name for p in Path('.').glob('playbox-*.user.js'))
+          assert len(files) == 13
+          bundles = {
+              'Playbox-All-Userscripts.zip': files,
+              'Playbox-Inventory-Tools.zip': ['playbox-' + s + '.user.js' for s in ['fulfillment','replenishment','transfer']],
+              'Playbox-POS-Tools.zip': ['playbox-' + s + '.user.js' for s in ['discount','transfer']],
+          }
+          for archive, names in bundles.items():
+              with ZipFile(archive,'w') as z:
+                  for name in names:
+                      info = ZipInfo(name,(2026,11,28,0,0,0))
+                      z.writestr(info,Path(name).read_bytes(),compress_type=ZIP_DEFLATED,compresslevel=9)
+              with ZipFile(archive) as z:
+                  assert z.namelist() == names and z.testzip() is None
+                  assert all(z.read(n) == Path(n).read_bytes() for n in names)
+      - name: Publish individual scripts and ZIP downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: suite-2026.11.28
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          [下载完整整合包（13 份脚本）](https://github.com/Leslia98/Playbox-POS-Tools/releases/download/suite-2026.11.28/Playbox-All-Userscripts.zip)
+          
+          本次发布包含 Chrome 已启用的 13 份油猴脚本，版本与 2026-11-28 同步的源码一致。完整包解压后可按需安装，也可以在附件中单独下载对应的 .user.js。
+          
+          配货中心 1.2.18.8、补货提醒 0.1.28、快捷调货 0.2.16、优惠 0.2.11，以及仓库路线与收藏、包装条码与单位、历史库存查询、商品与购物车、小票与打印、拆色与制造、现金明细、界面与快捷操作、订单工具。
+          NOTES
+          gh release create "$TAG" --draft --target bd668c55ad1a4496649b90e124da730f83612eba --title 'Playbox POS 全套脚本 · 2026-11-28' --notes-file "$RUNNER_TEMP/notes.md" playbox-*.user.js Playbox-*.zip usage-0.2.2.txt
+          test "$(gh release view "$TAG" --json assets --jq '.assets | length')" -eq 17
+          gh release edit "$TAG" --draft=false --latest
